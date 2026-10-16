@@ -283,13 +283,17 @@ jobs:
           fi
 
       - name: Warm up SASL credentials
-        # Register both SCRAM mechanisms in one call so the second does not
-        # overwrite the first, then verify both are present.
+        # One call per mechanism: a KRaft controller rejects a request that
+        # alters the same user twice (DuplicateResourceException), even for
+        # different mechanisms. Credentials are stored per mechanism, so the
+        # second call does not replace the first; the describe below checks it.
         run: |
-          docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh \
-            --bootstrap-server localhost:9092 \
-            --alter --add-config 'SCRAM-SHA-256=[password=scram-secret],SCRAM-SHA-512=[password=scram-secret]' \
-            --entity-type users --entity-name scram-user
+          for mechanism in SCRAM-SHA-256 SCRAM-SHA-512; do
+            docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh \
+              --bootstrap-server localhost:9092 \
+              --alter --add-config "${mechanism}=[password=scram-secret]" \
+              --entity-type users --entity-name scram-user
+          done
           docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh \
             --bootstrap-server localhost:9092 \
             --describe --entity-type users --entity-name scram-user | tee /tmp/ci-scram-users.log
