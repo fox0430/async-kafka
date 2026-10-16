@@ -1108,7 +1108,9 @@ suite "Broker: allowlist bounds a resolved name":
 
   test "a name that resolves into the rules connects":
     proc testBody() {.async: (raises: [Exception]).} =
-      let fb = newFakeBroker(resolveTAddress("localhost", Port(0))[0])
+      # Listen on the v4 answer: the rules admit 127/8 only, so a `::1` listener
+      # (the first answer where localhost also maps to ::1) is never dialed.
+      let fb = newFakeBroker(initTAddress("127.0.0.1:0"))
       defer:
         await fb.close()
 
