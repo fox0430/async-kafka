@@ -1,3 +1,37 @@
+# Nim build artifacts
 nimcache/
 nimblecache/
 htmldocs/
+*.exe
+
+# Compiled test/example binaries (Nim outputs an extensionless executable next to the .nim source)
+tests/test_*
+!tests/test_*.nim
+!tests/test_*.nims
+# Aggregated and contract-test binaries (the `tests/test_*` glob does not catch these).
+tests/unit_tests
+tests/all_tests
+tests/public_api_check
+async_kafka/consumer/fetcher
+
+# Compiled example binaries (Nim outputs the executable next to the .nim source).
+examples/*
+!examples/*.nim
+!examples/*.md
+
+# Editor / OS
+*.swp
+*.swo
+.DS_Store
+
+# Local overrides
+*.local.nims
+/config.nims
+nimble.develop
+nimble.paths
+nimbledeps
+
+audit/
+.audit*/
+
+docker/certs/
