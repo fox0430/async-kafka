@@ -12,6 +12,10 @@ const
   expectedSemanticApiSize = 208
   qualifiedManifestPath = "tests/public_api.txt"
   semanticManifestPath = "tests/public_api.signatures.txt"
+  # Root of the Nim installation whose compiler sources are linked in; mirrors
+  # the compiler path in tests/config.nims. Without it the compiler infers the
+  # prefix from this binary's location and misses config/nim.cfg.
+  nimRoot = getCurrentCompilerExe().parentDir.parentDir
 
 type ContractCapture = object
   qualifiedEntries: seq[string]
@@ -206,6 +210,7 @@ proc main() =
   let updateSemanticManifest = "--update" in commandLineParams()
 
   var config = newConfigRef()
+  config.prefixDir = AbsoluteDir(nimRoot)
   config.projectPath = AbsoluteDir(projectRoot)
   config.projectName = splitFile(projectFile).name
   config.projectFull = AbsoluteFile(projectFile)
