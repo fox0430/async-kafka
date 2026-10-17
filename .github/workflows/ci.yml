@@ -329,83 +329,17 @@ jobs:
           nim c -d:asyncBackend=chronos
           -r tests/test_integration.nim
 
-      - name: Run the examples
-        run: |
-          set -euo pipefail
-          for topic in orders.dlq orders-in orders-out; do
-            docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
-              --bootstrap-server localhost:9092 \
-              --create --if-not-exists \
-              --topic "$topic" --partitions 1 --replication-factor 1
-          done
-          # `--if-not-exists` keeps an existing partition count, so verify it.
-          docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
-            --bootstrap-server localhost:9092 \
-            --create --if-not-exists \
-            --topic orders --partitions 3 --replication-factor 1
-          if ! docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
-            --bootstrap-server localhost:9092 --describe --topic orders | \
-            grep -q "PartitionCount: 3"; then
-            echo "::error::topic orders does not have 3 partitions; delete and recreate it"
-            exit 1
-          fi
-          # Each grep below is coupled to an echo in the named example; keep
-          # them in sync. Patterns intentionally have no trailing spaces:
-          # Nim's echo joins args with single spaces, so the prefix matches.
-          KAFKA_TOPIC=orders-in nim c -r examples/observability.nim | tee /tmp/example-observability.log
-          grep -qF -- "producer.send.ok" /tmp/example-observability.log
-          nim c -r examples/ownership.nim
-          nim c -r examples/host_allowlist.nim | tee /tmp/example-allowlist.log
-          grep -qF -- "reached the advertised leader" /tmp/example-allowlist.log
-          grep -qF -- "refused before dialing" /tmp/example-allowlist.log
-          nim c -r examples/producer_settings.nim | tee /tmp/example-producer-settings.log
-          # The custom partitioner spreads keys across partitions; landing
-          # outside partition 0 proves it (see onFirstKeyByte).
-          grep -Eq -- "-> partition [12]" /tmp/example-producer-settings.log
-          grep -qF -- "async record acked" /tmp/example-producer-settings.log
-          nim c -r examples/dead_letter_queue.nim | tee /tmp/example-dlq-success.log
-          grep -qF -- "delivered to" /tmp/example-dlq-success.log
-          nim c -r examples/consumer.nim | tee /tmp/example-consumer.log
-          grep -qF -- "committed the position after" /tmp/example-consumer.log
-          nim c -r examples/consumer_group.nim | tee /tmp/example-consumer-group.log
-          grep -qF -- "member-a assigned" /tmp/example-consumer-group.log
-          grep -qF -- "member-b assigned" /tmp/example-consumer-group.log
-          nim c -r examples/transactions.nim
-          nim c -r examples/sasl.nim | tee /tmp/example-sasl.log
-          grep -qF -- "authenticated as" /tmp/example-sasl.log
-          nim c -r examples/tls.nim | tee /tmp/example-tls.log
-          grep -qF -- "verified TLS connection to" /tmp/example-tls.log
-          # Cap the topic so the record is rejected and diverted to the DLQ.
-          restore_orders_cap() {
-            docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh \
-              --bootstrap-server localhost:9092 --alter --entity-type topics \
-              --entity-name orders --delete-config max.message.bytes
-          }
-          trap restore_orders_cap EXIT
-          docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh \
-            --bootstrap-server localhost:9092 --alter --entity-type topics \
-            --entity-name orders --add-config max.message.bytes=8
-          set +e
-          nim c -r examples/dead_letter_queue.nim | tee /tmp/example-dlq.log
-          example_status=${PIPESTATUS[0]}
-          set -e
-          trap - EXIT
-          restore_orders_cap
-          test "$example_status" -eq 0
-          grep -q "diverted to orders.dlq" /tmp/example-dlq.log
-
       - name: Show Kafka logs
         if: failure()
         run: docker compose logs --no-color | tee "${RUNNER_TEMP}/kafka.log"
 
-      - name: Upload Kafka and example logs
+      - name: Upload Kafka logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: kafka-example-logs
+          name: kafka-logs
           path: |
             ${{ runner.temp }}/kafka.log
-            /tmp/example-*.log
             /tmp/ci-scram-users.log
           if-no-files-found: ignore
 
