@@ -9230,3 +9230,284 @@ suite "Producer: terminal failure republishes sibling in-flight batches":
       await cluster.close()
 
     waitFor testBody()
+
+proc decodeSingleProduceRecord(
+    body: seq[byte]
+): tuple[key: Option[seq[byte]], value: Option[seq[byte]]] =
+  var r = initKafkaReader(body)
+  let pReq = r.decode(ProduceRequest, 3'i16)
+  doAssert pReq.topics.len == 1
+  doAssert pReq.topics[0].partitions.len == 1
+  var br = initKafkaReader(pReq.topics[0].partitions[0].recordSet)
+  let batch = br.decode(RecordBatch)
+  doAssert batch.records.len == 1
+  (batch.records[0].key, batch.records[0].value)
+
+proc autoRespondCaptureProduce(
+    fb: FakeBroker,
+    host: string,
+    port: int32,
+    topic: string,
+    captured: ref seq[byte],
+    produceErrorCode: int16 = 0'i16,
+) {.async: (raises: []).} =
+  while true:
+    var req: CapturedRequest
+    try:
+      req = await fb.nextRequest(timeout = 500.milliseconds)
+    except CatchableError:
+      break
+    try:
+      let key = req.apiKey
+      if key == int16(ord(akApiVersions)):
+        await req.respond(
+          buildApiVersionsResponseBody(
+            0'i16,
+            [
+              FakeApiVersion(
+                apiKey: int16(ord(akApiVersions)), minVersion: 0, maxVersion: 0
+              ),
+              FakeApiVersion(
+                apiKey: int16(ord(akMetadata)), minVersion: 1, maxVersion: 1
+              ),
+              FakeApiVersion(
+                apiKey: int16(ord(akProduce)), minVersion: 3, maxVersion: 3
+              ),
+            ],
+          )
+        )
+      elif key == int16(ord(akMetadata)):
+        await req.respond(
+          buildMetadataResponseBody(
+            [FakeBrokerMeta(nodeId: 0'i32, host: host, port: port)],
+            controllerId = 0'i32,
+            topics = [
+              FakeTopicMeta(
+                name: topic,
+                errorCode: 0'i16,
+                isInternal: false,
+                partitions: @[
+                  FakePartitionMeta(
+                    partitionIndex: 0'i32,
+                    leaderId: 0'i32,
+                    replicas: @[0'i32],
+                    isr: @[0'i32],
+                  )
+                ],
+              )
+            ],
+          )
+        )
+      elif key == int16(ord(akProduce)):
+        captured[] = req.body
+        await req.respond(
+          buildProduceResponseBody(
+            topic = topic,
+            partition = 0'i32,
+            errorCode = produceErrorCode,
+            baseOffset = 0'i64,
+            logAppendTimeMs = -1'i64,
+            throttleTimeMs = 0'i32,
+          )
+        )
+    except CatchableError:
+      break
+
+suite "Producer: tombstone":
+  test "send with none value reaches the broker as null":
+    proc body() {.async: (raises: [Exception]).} =
+      const topic = "tombstone-topic"
+      let fb = newFakeBroker()
+      let host = "127.0.0.1"
+      let port = int32(fb.address().port)
+      let captured = new(seq[byte])
+      let respFut = autoRespondCaptureProduce(fb, host, port, topic, captured)
+      let cluster = newCluster(@[host & ":" & $port], clientId = "tombstone-test")
+      let p = newKafkaProducer(cluster, lingerMs = 0, timeoutMs = 1500)
+      try:
+        let key = some(toBytes("tombstone-key"))
+        let res = await p.send(topic, none(seq[byte]), key = key, partition = 0'i32)
+        check res.status == pstSuccess
+        let (wireKey, wireValue) = decodeSingleProduceRecord(captured[])
+        check wireKey == key
+        check wireValue.isNone
+      finally:
+        await p.close()
+        await fb.close()
+        awaitDrain(respFut, 1.seconds)
+        await cluster.close()
+
+    waitFor body()
+
+  test "seq overload still sends a non-null value":
+    proc body() {.async: (raises: [Exception]).} =
+      const topic = "tombstone-compat-topic"
+      let fb = newFakeBroker()
+      let host = "127.0.0.1"
+      let port = int32(fb.address().port)
+      let captured = new(seq[byte])
+      let respFut = autoRespondCaptureProduce(fb, host, port, topic, captured)
+      let cluster = newCluster(@[host & ":" & $port], clientId = "tombstone-compat")
+      let p = newKafkaProducer(cluster, lingerMs = 0, timeoutMs = 1500)
+      try:
+        let res = await p.send(topic, @[0xAB'u8], partition = 0'i32)
+        check res.status == pstSuccess
+        let (_, wireValue) = decodeSingleProduceRecord(captured[])
+        check wireValue == some(@[0xAB'u8])
+        let resOpt = await p.send(topic, some(@[0xCD'u8]), partition = 0'i32)
+        check resOpt.status == pstSuccess
+        let (_, wireOpt) = decodeSingleProduceRecord(captured[])
+        check wireOpt == some(@[0xCD'u8])
+      finally:
+        await p.close()
+        await fb.close()
+        awaitDrain(respFut, 1.seconds)
+        await cluster.close()
+
+    waitFor body()
+
+  test "seq overload sends empty bytes distinctly from tombstone null":
+    proc body() {.async: (raises: [Exception]).} =
+      const topic = "tombstone-empty-topic"
+      let fb = newFakeBroker()
+      let host = "127.0.0.1"
+      let port = int32(fb.address().port)
+      let captured = new(seq[byte])
+      let respFut = autoRespondCaptureProduce(fb, host, port, topic, captured)
+      let cluster = newCluster(@[host & ":" & $port], clientId = "tombstone-empty")
+      let p = newKafkaProducer(cluster, lingerMs = 0, timeoutMs = 1500)
+      try:
+        let resEmpty = await p.send(topic, @[], partition = 0'i32)
+        check resEmpty.status == pstSuccess
+        let (_, wireEmpty) = decodeSingleProduceRecord(captured[])
+        check wireEmpty.isSome
+        check wireEmpty.get.len == 0
+        let resNil = await p.send(topic, seq[byte](nil), partition = 0'i32)
+        check resNil.status == pstSuccess
+        let (_, wireNil) = decodeSingleProduceRecord(captured[])
+        check wireNil.isSome
+        check wireNil.get.len == 0
+        let resNone = await p.send(topic, none(seq[byte]), partition = 0'i32)
+        check resNone.status == pstSuccess
+        let (_, wireNone) = decodeSingleProduceRecord(captured[])
+        check wireNone.isNone
+      finally:
+        await p.close()
+        await fb.close()
+        awaitDrain(respFut, 1.seconds)
+        await cluster.close()
+
+    waitFor body()
+
+  test "sendFireAndForget seq overload forwards a non-null value":
+    proc body() {.async: (raises: [Exception]).} =
+      const topic = "tombstone-ff-compat-topic"
+      let fb = newFakeBroker()
+      let host = "127.0.0.1"
+      let port = int32(fb.address().port)
+      let captured = new(seq[byte])
+      let respFut = autoRespondCaptureProduce(fb, host, port, topic, captured)
+      let cluster = newCluster(@[host & ":" & $port], clientId = "tombstone-ff-compat")
+      let p = newKafkaProducer(cluster, lingerMs = 0, timeoutMs = 1500)
+      try:
+        var got: Option[ProduceResult]
+        let cb: ProduceCallback = proc(
+            res: ProduceResult, err: ref KafkaError
+        ) {.gcsafe, raises: [].} =
+          got = some(res)
+        await p.sendFireAndForget(topic, @[0xAB'u8], partition = 0'i32, callback = cb)
+        var attempts = 0
+        while got.isNone and attempts < 100:
+          await sleepAsync(10.milliseconds)
+          inc attempts
+        check got.isSome
+        check got.get.status == pstSuccess
+        let (_, wireValue) = decodeSingleProduceRecord(captured[])
+        check wireValue == some(@[0xAB'u8])
+      finally:
+        await p.close()
+        await fb.close()
+        awaitDrain(respFut, 1.seconds)
+        await cluster.close()
+
+    waitFor body()
+
+  test "sendFireAndForget with none value reaches the broker as null":
+    proc body() {.async: (raises: [Exception]).} =
+      const topic = "tombstone-ff-topic"
+      let fb = newFakeBroker()
+      let host = "127.0.0.1"
+      let port = int32(fb.address().port)
+      let captured = new(seq[byte])
+      let respFut = autoRespondCaptureProduce(fb, host, port, topic, captured)
+      let cluster = newCluster(@[host & ":" & $port], clientId = "tombstone-ff")
+      let p = newKafkaProducer(cluster, lingerMs = 0, timeoutMs = 1500)
+      try:
+        var got: Option[ProduceResult]
+        let cb: ProduceCallback = proc(
+            res: ProduceResult, err: ref KafkaError
+        ) {.gcsafe, raises: [].} =
+          got = some(res)
+        await p.sendFireAndForget(
+          topic,
+          none(seq[byte]),
+          key = some(toBytes("k")),
+          partition = 0'i32,
+          callback = cb,
+        )
+        var attempts = 0
+        while got.isNone and attempts < 100:
+          await sleepAsync(10.milliseconds)
+          inc attempts
+        check got.isSome
+        let (_, wireValue) = decodeSingleProduceRecord(captured[])
+        check wireValue.isNone
+      finally:
+        await p.close()
+        await fb.close()
+        awaitDrain(respFut, 1.seconds)
+        await cluster.close()
+
+    waitFor body()
+
+  test "DLQ preserves a tombstone null instead of empty bytes":
+    proc body() {.async: (raises: [Exception]).} =
+      const sourceTopic = "tombstone-dlq-src"
+      const dlqTopic = "tombstone-dlq-dest"
+      let host = "127.0.0.1"
+      let srcFb = newFakeBroker()
+      let srcPort = int32(srcFb.address().port)
+      let dlqFb = newFakeBroker()
+      let dlqPort = int32(dlqFb.address().port)
+      let dlqCaptured = new(seq[byte])
+      let srcRespFut = autoRespondCaptureProduce(
+        srcFb, host, srcPort, sourceTopic, new(seq[byte]), produceErrorCode = 87'i16
+      )
+      let dlqRespFut =
+        autoRespondCaptureProduce(dlqFb, host, dlqPort, dlqTopic, dlqCaptured)
+      let cluster = newCluster(@[host & ":" & $srcPort], clientId = "tombstone-dlq")
+      let dlqCluster =
+        newCluster(@[host & ":" & $dlqPort], clientId = "tombstone-dlq-dest")
+      let dlq = newKafkaProducer(dlqCluster, lingerMs = 0, timeoutMs = 1500)
+      let main =
+        newKafkaProducer(cluster, lingerMs = 0, maxRetries = 0, timeoutMs = 1500)
+      main.errorHandler = alwaysDeadLetter()
+      await main.setDeadLetterQueue(dlqTopic, dlq)
+      try:
+        let res = await main.send(
+          sourceTopic, none(seq[byte]), key = some(toBytes("k")), partition = 0'i32
+        )
+        check res.status == pstDeadLettered
+        let (_, dlqValue) = decodeSingleProduceRecord(dlqCaptured[])
+        check dlqValue.isNone
+      finally:
+        await main.close()
+        await dlq.close()
+        await srcFb.close()
+        await dlqFb.close()
+        awaitDrain(srcRespFut, 1.seconds)
+        awaitDrain(dlqRespFut, 1.seconds)
+        await cluster.close()
+        await dlqCluster.close()
+
+    waitFor body()

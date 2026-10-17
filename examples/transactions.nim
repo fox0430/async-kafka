@@ -54,13 +54,10 @@ proc main() {.async.} =
       var offsets = initTable[TopicPartition, int64]()
       for rec in records:
         # The key and the headers decide how the output partitions and compacts,
-        # so they are forwarded; `send` takes a value rather than an option, so a
-        # null (tombstone) value arrives as empty bytes.
+        # so they are forwarded; `send` takes an option value so a
+        # null (tombstone) value is preserved.
         discard await producer.send(
-          topic = outTopic,
-          value = rec.value.get(@[]),
-          key = rec.key,
-          headers = rec.headers,
+          topic = outTopic, value = rec.value, key = rec.key, headers = rec.headers
         )
         # The committed offset is the next one to read: last processed + 1.
         offsets[TopicPartition(topic: rec.topic, partition: rec.partition)] =
