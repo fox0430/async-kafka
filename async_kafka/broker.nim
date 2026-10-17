@@ -801,13 +801,26 @@ proc connectImpl(b: Broker) {.async: (raises: [KafkaError, CancelledError]).} =
   # advertised name — a metadata response can carry any string, and only the address
   # says where the socket goes.
   if b.hostAllowlist != nil:
+    let resolvedCount = addresses.len
     addresses = addresses.filterIt(addressAllowed(b.hostAllowlist, it))
     if addresses.len == 0:
       raise newException(
         KafkaConnectionError,
         "broker address " & b.host & ":" & $b.port &
-          " is not permitted by the configured host allowlist",
+          " is not permitted by the configured host allowlist (resolved " &
+          $resolvedCount & " addresses, " & $(resolvedCount - addresses.len) &
+          " excluded by allowlist)",
       )
+    elif addresses.len < resolvedCount:
+      debug "Broker ",
+        b.host,
+        ":",
+        $b.port,
+        ": ",
+        $(resolvedCount - addresses.len),
+        " of ",
+        $resolvedCount,
+        " resolved addresses excluded by host allowlist"
 
   # The seq form wins, else the singular field, else `none` (skip SASL entirely).
   var candidates: seq[Option[SaslMechanism]]
@@ -847,6 +860,12 @@ proc connectImpl(b: Broker) {.async: (raises: [KafkaError, CancelledError]).} =
         raise
     if not connected:
       b.recordFailure("tcp_connect")
+      if addresses.len > 1:
+        raise newException(
+          KafkaConnectionError,
+          "failed to connect to broker " & b.host & ":" & $b.port & " (" & $addresses.len &
+            " addresses tried): " & tcpFailure.msg,
+        )
       raise tcpFailure
 
     # Retire may have landed during connectTcp: close the fresh socket rather than

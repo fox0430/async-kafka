@@ -7,8 +7,9 @@
 ## is opened.
 ##
 ## Rules come from `allowHost` (one literal address), `allowCidr` (a block), and
-## `allowPrivateHosts` (RFC1918 + loopback, deliberately excluding link-local
-## and cloud metadata addresses). A rule always names an address, never a name:
+## `allowPrivateHosts` (RFC1918 and loopback, 127/8 and ::1/128, deliberately
+## excluding link-local, cloud metadata, and IPv6 unique-local addresses).
+## A rule always names an address, never a name:
 ## an advertised host name is resolved first and every answer is checked, while
 ## the `hostAllowed` predicate takes a literal and denies anything else.
 ##

@@ -1108,8 +1108,8 @@ suite "Broker: allowlist bounds a resolved name":
 
   test "a name that resolves into the rules connects":
     proc testBody() {.async: (raises: [Exception]).} =
-      # Listen on the v4 answer: the rules admit 127/8 only, so a `::1` listener
-      # (the first answer where localhost also maps to ::1) is never dialed.
+      # Listen on the v4 loopback answer: both 127/8 and ::1 are admitted, so
+      # whichever answer localhost resolves to first, the dial stays permitted.
       let fb = newFakeBroker(initTAddress("127.0.0.1:0"))
       defer:
         await fb.close()
@@ -2107,12 +2107,18 @@ suite "Broker host allowlist":
     check allow.hostAllowed("172.31.255.255")
     check allow.hostAllowed("192.168.1.1")
     check allow.hostAllowed("127.0.0.1")
+    check allow.hostAllowed("::1")
     # The boundaries are the point: 172.15/172.32 are outside RFC1918.
     check not allow.hostAllowed("172.15.255.255")
     check not allow.hostAllowed("172.32.0.1")
     check not allow.hostAllowed("203.0.113.7")
     check not allow.hostAllowed("169.254.169.254") # link-local / cloud metadata
+    check not allow.hostAllowed("::ffff:169.254.169.254")
+    check not allow.hostAllowed("fe80::1") # IPv6 link-local excluded
     check not allow.hostAllowed("8.8.8.8")
+    check not allow.hostAllowed("fc00::1") # unique-local excluded
+    check not allow.hostAllowed("fd00::1") # unique-local excluded
+    check not allow.hostAllowed("2001:db8::1")
 
   test "rules combine as OR, and an unparseable host is denied":
     let allow = newHostAllowlist(@[allowHost("10.0.0.5"), allowCidr("192.168.0.0/16")])
