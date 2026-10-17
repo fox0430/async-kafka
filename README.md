@@ -179,8 +179,10 @@ builds one and connects under it.
 Rules come from `allowHost`, `allowCidr`, and `allowPrivateHosts`, combined by
 `newHostAllowlist`: a rule names an address, an advertised name is resolved with
 every answer checked, the check fails closed, and omitting the parameter permits
-every advertised address. The convenience constructors accept the same rules for
-the Cluster they build (`HostAllowlist`).
+every advertised address. `allowPrivateHosts` covers RFC1918 and loopback
+(127/8 and ::1/128), excluding link-local and IPv6 unique-local addresses;
+combine it with `allowCidr` for other IPv6 ranges. The convenience constructors
+accept the same rules for the Cluster they build (`HostAllowlist`).
 
 ### Ownership and shutdown order
 

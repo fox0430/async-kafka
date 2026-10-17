@@ -15,7 +15,7 @@ type
     hrkExact
     hrkIp4Prefix
     hrkIp6Prefix
-    hrkIp4Networks
+    hrkPrivateNetworks
 
   HostRule* = object
     ## One entry of an allowlist. Carries the address as bytes rather than a
@@ -26,7 +26,9 @@ type
     address: array[16, byte]
     prefixLen: int # bits, counted from the first byte
     networks: seq[tuple[base: uint32, bits: int]]
-      # hrkIp4Networks only: the shorthand rules hold several ranges at once.
+      # hrkPrivateNetworks: IPv4 ranges held at once.
+    v6Networks: seq[tuple[base: array[16, byte], bits: int]]
+      # hrkPrivateNetworks only: IPv6 ranges held alongside `networks`.
 
   HostAllowlist* = ref object
     ## Rules the address a broker is actually dialed at must match, built by
@@ -523,8 +525,11 @@ proc allowCidr*(cidr: string): HostRule {.raises: [KafkaError].} =
 
 proc allowPrivateHosts*(): HostRule =
   ## Rule admitting the addresses a same-datacentre or containerised broker fleet
-  ## uses: RFC1918 (10/8, 172.16/12, 192.168/16) and loopback (127/8). Deliberately
-  ## EXCLUDES link-local (169.254/16, where cloud instance metadata lives).
+  ## uses: RFC1918 (10/8, 172.16/12, 192.168/16) and loopback (127/8 and ::1/128).
+  ## Deliberately EXCLUDES link-local (169.254/16, where cloud instance metadata
+  ## lives) and IPv6 unique-local addresses (fc00::/7): the allowlist combines by
+  ## OR only, so a broad ULA range would also admit infrastructure addresses
+  ## inside it. Combine with allowCidr for other IPv6 ranges as needed.
   for (base, bits) in [
     (0x0A000000'u32, 8), # 10.0.0.0/8
     (0xAC100000'u32, 12), # 172.16.0.0/12
@@ -532,7 +537,9 @@ proc allowPrivateHosts*(): HostRule =
     (0x7F000000'u32, 8), # 127.0.0.0/8
   ]:
     result.networks.add((base: base, bits: bits))
-  result.kind = hrkIp4Networks
+  const loopback6: array[16, byte] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+  result.v6Networks.add((base: loopback6, bits: 128))
+  result.kind = hrkPrivateNetworks
 
 proc v4Of(ip: IpAddress): uint32 =
   ## The IPv4 address `ip` denotes, whether written as v4 or as IPv4-mapped v6.
@@ -560,14 +567,19 @@ proc ruleMatches(rule: HostRule, ip: IpAddress): bool =
   ## cannot be satisfied by the v4 address it wraps.
   let v4shaped = ip.family == IpAddressFamily.IPv4 or ip.isIp4MappedV6()
   case rule.kind
-  of hrkIp4Networks:
-    if not v4shaped:
-      return false
-    let v = v4Of(ip)
-    for n in rule.networks:
-      if v4PrefixMatches(v, n.base, n.bits):
-        return true
-    false
+  of hrkPrivateNetworks:
+    if v4shaped:
+      let v = v4Of(ip)
+      for n in rule.networks:
+        if v4PrefixMatches(v, n.base, n.bits):
+          return true
+      false
+    else:
+      let candidate = ip.toIp6Bytes()
+      for n in rule.v6Networks:
+        if prefixMatches(candidate, n.base, n.bits):
+          return true
+      false
   of hrkIp4Prefix:
     if not v4shaped:
       return false
@@ -871,7 +883,9 @@ proc connect*(
   try:
     transport = await connectFut.wait(milliseconds(effectiveConnectTimeoutMs))
   except TransportError as e:
-    raise newException(KafkaConnectionError, "failed to connect: " & e.msg)
+    raise newException(
+      KafkaConnectionError, "failed to connect to " & $address & ": " & e.msg
+    )
   except AsyncTimeoutError:
     await connectFut.cancelAndWait()
     if connectFut.completed:
