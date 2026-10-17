@@ -1,0 +1,348 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/ci.yml'
+      - 'async_kafka.nim*'
+      - 'async_kafka/**'
+      - 'examples/**'
+      - 'tests/**'
+      - 'nimble.lock'
+      - 'docker-compose.yml'
+      - 'docker/**'
+  pull_request:
+    paths:
+      - '.github/workflows/ci.yml'
+      - 'async_kafka.nim*'
+      - 'async_kafka/**'
+      - 'examples/**'
+      - 'tests/**'
+      - 'nimble.lock'
+      - 'docker-compose.yml'
+      - 'docker/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs cancel their own earlier runs; main pushes never cancel each other
+  # so a merged result always finishes reporting.
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: Unit tests (Nim ${{ matrix.nim-version }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        nim-version: ["2.2.8", "stable"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.nim-version }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Nimble
+        uses: nim-lang/setup-nimble-action@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes liblz4-dev
+
+      - name: Install Nim dependencies
+        run: nimble install --accept --depsOnly
+
+      - name: Configure Nim dependencies
+        run: nimble setup
+
+      - name: Verify zstd resolution
+        # The expected version is parsed from async_kafka.nimble so a version
+        # bump does not need a second edit here; failures print nimble.paths.
+        run: |
+          expected=$(sed -n 's|.*nim_zstd == \([0-9.]*\).*|\1|p' async_kafka.nimble)
+          if [ -z "$expected" ]; then
+            echo "::error::cannot parse zstd version from async_kafka.nimble"
+            exit 1
+          fi
+          if ! grep -qF -- "zstd-${expected}-" nimble.paths; then
+            echo "::error::nimble resolved zstd ${expected} not found in nimble.paths"
+            cat nimble.paths
+            exit 1
+          fi
+
+      - name: Type-check the package against the locked dependencies
+        # `nimble check` passes sources that do not type-check.
+        run: nimble verify
+
+      - name: Type-check the examples
+        run: nimble check_examples
+
+      - name: Run unit tests
+        run: nimble test
+
+      - name: Compile the aggregate test entry point
+        # Used only by local `nimble test_integration`.
+        run: >-
+          nim c -d:asyncBackend=chronos
+          --compileOnly tests/all_tests.nim
+
+  unit-devel:
+    name: Unit tests (Nim devel, experimental)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    # Informational only: devel tracks upstream and may break independently
+    # of this repo, so it never gates integration and never blocks merging.
+    # Keep the steps in sync with `unit` above.
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: devel
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Nimble
+        uses: nim-lang/setup-nimble-action@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes liblz4-dev
+
+      - name: Install Nim dependencies
+        run: nimble install --accept --depsOnly
+
+      - name: Configure Nim dependencies
+        run: nimble setup
+
+      - name: Run unit tests
+        run: nimble test
+
+  static:
+    name: Docs check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "stable"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Nimble
+        uses: nim-lang/setup-nimble-action@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nim dependencies
+        run: nimble install --accept --depsOnly
+
+      - name: Configure Nim dependencies
+        run: nimble setup
+
+      # Formatting is checked by .github/workflows/nph.yml (single source of
+      # truth) so this job does not install a second nph version here.
+
+      - name: Build the API documentation
+        # `nim doc` exits 0 on warnings.
+        run: |
+          set -o pipefail
+          nim doc --project --index:on --outdir:"$RUNNER_TEMP/doc" async_kafka.nim \
+            2>&1 | tee "$RUNNER_TEMP/nimdoc.log"
+          if grep -q "Warning:" "$RUNNER_TEMP/nimdoc.log"; then
+            echo "::error::nim doc emitted warnings"
+            exit 1
+          fi
+
+      - name: Upload nimdoc log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nimdoc-log
+          path: ${{ runner.temp }}/nimdoc.log
+          if-no-files-found: ignore
+
+  integration:
+    name: Integration tests
+    needs: unit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "stable"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Nimble
+        uses: nim-lang/setup-nimble-action@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes liblz4-dev
+
+      - name: Install Nim dependencies
+        run: nimble install --accept --depsOnly
+
+      - name: Configure Nim dependencies
+        run: nimble setup
+
+      - name: Verify zstd resolution
+        # The expected version is parsed from async_kafka.nimble so a version
+        # bump does not need a second edit here; failures print nimble.paths.
+        run: |
+          expected=$(sed -n 's|.*nim_zstd == \([0-9.]*\).*|\1|p' async_kafka.nimble)
+          if [ -z "$expected" ]; then
+            echo "::error::cannot parse zstd version from async_kafka.nimble"
+            exit 1
+          fi
+          if ! grep -qF -- "zstd-${expected}-" nimble.paths; then
+            echo "::error::nimble resolved zstd ${expected} not found in nimble.paths"
+            cat nimble.paths
+            exit 1
+          fi
+
+      - name: Start Kafka
+        run: docker compose up --detach --wait
+
+      - name: Warm up Kafka coordinators
+        run: |
+          docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create --if-not-exists \
+            --topic ci-readiness --partitions 1 --replication-factor 1
+          docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server localhost:9092 \
+            --topic ci-readiness --group ci-readiness \
+            --from-beginning --timeout-ms 10000
+          for attempt in $(seq 1 60); do
+            if docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+              --bootstrap-server localhost:9092 \
+              --describe --group ci-readiness --state >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              docker compose logs --no-color kafka
+              exit 1
+            fi
+            sleep 1
+          done
+          # Pre-create the transaction state log so the first transactional
+          # request does not race auto-creation (UNKNOWN_TOPIC_OR_PARTITION).
+          docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create --if-not-exists \
+            --topic __transaction_state \
+            --partitions 1 --replication-factor 1 \
+            --config cleanup.policy=compact \
+            --config compression.type=uncompressed \
+            --config min.insync.replicas=1 \
+            --config segment.bytes=104857600
+          docker compose exec -T kafka /opt/kafka/bin/kafka-transactions.sh \
+            --bootstrap-server localhost:9092 list
+          txn_loaded=0
+          for attempt in $(seq 1 60); do
+            loaded=$(docker compose logs --no-color kafka | \
+              grep -c 'Completed loading transaction metadata' || true)
+            if [ "$loaded" -ge 1 ]; then
+              txn_loaded=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$txn_loaded" -ne 1 ]; then
+            docker compose logs --no-color kafka
+            exit 1
+          fi
+
+      - name: Warm up SASL credentials
+        # One call per mechanism: a KRaft controller rejects a request that
+        # alters the same user twice (DuplicateResourceException), even for
+        # different mechanisms. Credentials are stored per mechanism, so the
+        # second call does not replace the first; the describe below checks it.
+        run: |
+          for mechanism in SCRAM-SHA-256 SCRAM-SHA-512; do
+            docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh \
+              --bootstrap-server localhost:9092 \
+              --alter --add-config "${mechanism}=[password=scram-secret]" \
+              --entity-type users --entity-name scram-user
+          done
+          docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh \
+            --bootstrap-server localhost:9092 \
+            --describe --entity-type users --entity-name scram-user | tee /tmp/ci-scram-users.log
+          grep -q "SCRAM-SHA-256" /tmp/ci-scram-users.log
+          grep -q "SCRAM-SHA-512" /tmp/ci-scram-users.log
+          # Probe the SASL listeners before the suites run.
+          docker compose exec -T kafka bash -c '
+            printf "%s\n" \
+              "security.protocol=SASL_PLAINTEXT" \
+              "sasl.mechanism=SCRAM-SHA-512" \
+              "sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username=\"scram-user\" password=\"scram-secret\";" \
+              > /tmp/ci-sasl.properties
+            /opt/kafka/bin/kafka-topics.sh \
+              --bootstrap-server localhost:9094 \
+              --command-config /tmp/ci-sasl.properties --list > /dev/null
+          '
+          docker compose exec -T kafka bash -c '
+            printf "%s\n" \
+              "security.protocol=SASL_SSL" \
+              "sasl.mechanism=PLAIN" \
+              "sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"client\" password=\"client-secret\";" \
+              "ssl.truststore.location=/etc/kafka/secrets/certs/server.p12" \
+              "ssl.truststore.password=changeit" \
+              "ssl.truststore.type=PKCS12" \
+              > /tmp/ci-sasl-ssl.properties
+            /opt/kafka/bin/kafka-topics.sh \
+              --bootstrap-server localhost:9095 \
+              --command-config /tmp/ci-sasl-ssl.properties --list > /dev/null
+          '
+
+      - name: Run integration tests
+        run: >-
+          nim c -d:asyncBackend=chronos
+          -r tests/test_integration.nim
+
+      - name: Show Kafka logs
+        if: failure()
+        run: docker compose logs --no-color | tee "${RUNNER_TEMP}/kafka.log"
+
+      - name: Upload Kafka logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-logs
+          path: |
+            ${{ runner.temp }}/kafka.log
+            /tmp/ci-scram-users.log
+          if-no-files-found: ignore
+
+      - name: Stop Kafka
+        if: always()
+        run: docker compose down --volumes --remove-orphans
