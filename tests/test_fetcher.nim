@@ -1989,7 +1989,8 @@ suite "Fetcher: retriable per-partition errors back off":
     while true:
       var req: CapturedRequest
       try:
-        req = await fb.nextRequest(timeout = 250.milliseconds)
+        # Must outlast the client's backoff between rounds (up to ~250ms at attempt 2).
+        req = await fb.nextRequest(timeout = 2.seconds)
       except CatchableError:
         break
       try:
