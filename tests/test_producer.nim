@@ -9382,7 +9382,7 @@ suite "Producer: tombstone":
         let (_, wireEmpty) = decodeSingleProduceRecord(captured[])
         check wireEmpty.isSome
         check wireEmpty.get.len == 0
-        let resNil = await p.send(topic, seq[byte](nil), partition = 0'i32)
+        let resNil = await p.send(topic, default(seq[byte]), partition = 0'i32)
         check resNil.status == pstSuccess
         let (_, wireNil) = decodeSingleProduceRecord(captured[])
         check wireNil.isSome
