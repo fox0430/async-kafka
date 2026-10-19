@@ -1125,7 +1125,7 @@ proc startFlush(p: KafkaProducer, tp: TopicPartition) {.async: (raises: []).} =
 proc send*(
     p: KafkaProducer,
     topic: string,
-    value: seq[byte],
+    value: Option[seq[byte]],
     key: Option[seq[byte]] = none(seq[byte]),
     partition: int32 = -1,
     headers: seq[RecordHeader] = @[],
@@ -1134,6 +1134,10 @@ proc send*(
   ## Buffer one record for `topic` and resolve with its `ProduceResult` once acked. A negative
   ## `partition` selects via the configured strategy (key hash when keyed); oversized records
   ## raise before buffering. Inside a transaction the send joins it — commit only after it acked.
+  ##
+  ## A `none` value sends a tombstone (null value) for compacted topics; pair it
+  ## with a key so the broker can match the key to delete. A nil `seq[byte]` passed
+  ## to the `seq[byte]` overload stays an empty value, not a tombstone.
   ##
   ## A failure the producer's `errorHandler` diverts does not raise: the result's `status` is
   ## `pstDropped`, `pstDeadLettered`, or `pstDeadLetterFailed` (with `offset = -1`) instead of
@@ -1164,11 +1168,7 @@ proc send*(
 
   let actualTimestamp = resolveTimestamp(timestamp)
   let rec = Record(
-    offset: 0,
-    timestamp: actualTimestamp,
-    key: key,
-    value: some(value),
-    headers: headers,
+    offset: 0, timestamp: actualTimestamp, key: key, value: value, headers: headers
   )
   # Client-side validation runs before partition resolution, so the caller sees size
   # rejections without a metadata refresh.
@@ -1367,6 +1367,19 @@ proc send*(
         raise (ref KafkaError)(e)
       raise newException(KafkaError, e.msg)
 
+proc send*(
+    p: KafkaProducer,
+    topic: string,
+    value: seq[byte],
+    key: Option[seq[byte]] = none(seq[byte]),
+    partition: int32 = -1,
+    headers: seq[RecordHeader] = @[],
+    timestamp: int64 = 0,
+): Future[ProduceResult] {.async: (raises: [KafkaError, CancelledError]).} =
+  ## Non-null `send`; equivalent to the `Option` overload with `some(value)`.
+  ## Use the `Option` overload with `none(seq[byte])` for a tombstone.
+  return await p.send(topic, some(value), key, partition, headers, timestamp)
+
 proc sendToDeadLetter(
     p: KafkaProducer, rec: FailedRecord
 ): Future[bool] {.async: (raises: [CancelledError]).} =
@@ -1400,7 +1413,7 @@ proc sendToDeadLetter(
   try:
     dlqResult = await dlq.send(
       topic = dlqTopic,
-      value = rec.value.get(@[]),
+      value = rec.value,
       key = rec.key,
       headers = headers,
       timestamp = rec.timestamp,
@@ -1686,7 +1699,7 @@ proc abortTransaction*(
 proc sendFireAndForget*(
     p: KafkaProducer,
     topic: string,
-    value: seq[byte],
+    value: Option[seq[byte]],
     key: Option[seq[byte]] = none(seq[byte]),
     partition: int32 = -1,
     headers: seq[RecordHeader] = @[],
@@ -1696,6 +1709,8 @@ proc sendFireAndForget*(
   ## Send without awaiting the ack: the result (or failure) goes to `callback`,
   ## or to the logs when `callback` is nil. Returns once the send is handed to
   ## the pipeline, not once it is acked; `close` drains handed-off sends.
+  ## A `none` value sends a tombstone (null value) for compacted topics. A nil
+  ## `seq[byte]` passed to the `seq[byte]` overload stays an empty value.
   proc invokeCallback(res: ProduceResult, err: ref KafkaError) {.raises: [].} =
     if callback != nil:
       # ProduceCallback is `raises: []` but a buggy implementation can violate that; a
@@ -1748,3 +1763,19 @@ proc sendFireAndForget*(
 
   let fut = task()
   p.pendingFireAndForget.add(fut)
+
+proc sendFireAndForget*(
+    p: KafkaProducer,
+    topic: string,
+    value: seq[byte],
+    key: Option[seq[byte]] = none(seq[byte]),
+    partition: int32 = -1,
+    headers: seq[RecordHeader] = @[],
+    timestamp: int64 = 0,
+    callback: ProduceCallback = nil,
+) {.async: (raises: [CancelledError, KafkaClosedError]).} =
+  ## Non-null `sendFireAndForget`; equivalent to the `Option` overload with
+  ## `some(value)`. Use the `Option` overload with `none(seq[byte])` for a tombstone.
+  await p.sendFireAndForget(
+    topic, some(value), key, partition, headers, timestamp, callback
+  )
