@@ -1856,3 +1856,19 @@ suite "SCRAM hardening":
       "r=" & clientNonce & ",s=" & encode("salt") & ",i=" & $testIterations
     expect KafkaProtocolError:
       discard challengeSync(session, badServerFirst.toBytes())
+
+suite "SASL mechanism construction":
+  test "hand-built mechanism is rejected at construction":
+    let bad = SaslMechanism()
+    expect KafkaError:
+      discard newCluster(@["127.0.0.1:9092"], saslMechanism = bad)
+    expect KafkaError:
+      discard newCluster(@["127.0.0.1:9092"], saslMechanisms = @[bad])
+    expect KafkaError:
+      discard
+        newBroker(0'i32, "127.0.0.1", 9092'i32, "test-client", saslMechanism = bad)
+
+  test "nil mechanism is rejected as KafkaError":
+    let nilMech: SaslMechanism = nil
+    expect KafkaError:
+      validateMechanism(nilMech)

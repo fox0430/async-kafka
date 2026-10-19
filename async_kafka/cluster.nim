@@ -196,6 +196,8 @@ proc newCluster*(
       KafkaError, "bootstrapAddrs must contain at least one host:port address"
     )
   validateBrokerConfig(saslMechanisms, reconnectBackoffMs, reconnectBackoffMaxMs)
+  if saslMechanism != nil:
+    validateMechanism(saslMechanism)
   # Non-positive TTL makes the "metadata is fresh" fast path never succeed, so every
   # lookup pays a broker round-trip; 0 is not a caching off switch.
   if metadataMaxAge <= milliseconds(0):

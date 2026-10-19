@@ -54,6 +54,15 @@ proc requireTls*(m: SaslMechanism): bool {.raises: [].} =
   ## true, SCRAM to false; the value is fixed at construction.
   m.tlsRequired
 
+proc validateMechanism*(m: SaslMechanism) {.raises: [KafkaError].} =
+  ## Reject nil or a mechanism that bypassed the public constructors. An empty
+  ## construction carries no name and no session factory, and the broker layer
+  ## would dereference the nil factory on first use.
+  if m == nil or m.mechanismName.len == 0 or m.newSession == nil:
+    raise newException(
+      KafkaError, "saslMechanism was not built by newSaslPlain / newSaslScram"
+    )
+
 proc validateAscii*(s: string, fieldName: string) {.raises: [KafkaError].} =
   ## Reject credentials that are empty or contain anything outside printable ASCII
   ## (0x20..0x7E); SASLprep (RFC 4013) is not implemented, so ambiguous Unicode

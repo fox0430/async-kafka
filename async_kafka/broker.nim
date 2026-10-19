@@ -118,12 +118,14 @@ proc validateBrokerConfig*(
 ) {.raises: [KafkaError].} =
   ## Shared by `newCluster`, so a bad value fails while the cluster is built, and by
   ## `newBroker`, which has to reject it for a direct construction too. A nil
-  ## candidate would be dereferenced by the SASL handshake (a NilAccessDefect), and a
+  ## candidate or a hand-built mechanism would be dereferenced by the SASL
+  ## handshake (a nil factory call aborts the process), and a
   ## negative backoff would make `calculateBackoff` negative and silently disable the
   ## wait.
   for mech in saslMechanisms:
     if mech == nil:
       raise newException(KafkaError, "saslMechanisms must not contain nil entries")
+    validateMechanism(mech)
   if reconnectBackoffMs < 0:
     raise newException(
       KafkaError, "reconnectBackoffMs must be >= 0, got " & $reconnectBackoffMs
@@ -151,6 +153,8 @@ proc newBroker*(
     saslMechanisms: seq[SaslMechanism] = @[],
 ): Broker =
   validateBrokerConfig(saslMechanisms, reconnectBackoffMs, reconnectBackoffMaxMs)
+  if saslMechanism != nil:
+    validateMechanism(saslMechanism)
   Broker(
     nodeId: nodeId,
     host: host,
@@ -506,6 +510,7 @@ proc performSaslAuthOne(
 ) {.async: (raises: [KafkaError, CancelledError]).} =
   # Guard credential-leaking mechanisms (e.g. PLAIN) against non-TLS and unverified-TLS
   # connections, before any auth bytes go on the wire.
+  validateMechanism(mechanism)
   if mechanism.requireTls:
     if not b.conn.isTls():
       raise newException(
