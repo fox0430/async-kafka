@@ -950,7 +950,7 @@ proc unsupportedMechanism(): SaslMechanism =
       # Called before the handshake; the rejected mechanism leaves
       # initialResponse and challenge unused.
       SaslSession(
-        initialResponse: proc(): seq[byte] {.raises: [KafkaError].} =
+        initialResponse: proc(): seq[byte] {.gcsafe, raises: [].} =
           @[],
         challenge: proc(
             data: seq[byte]
