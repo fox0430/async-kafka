@@ -1,3 +1,5 @@
+import callback_guard
+
 type MetricsHook* = proc(
   event: cstring, tags: openArray[(cstring, cstring)], value: int64
 ) {.closure, gcsafe, raises: [].}
@@ -13,7 +15,8 @@ type MetricsHook* = proc(
   ##
   ## Runs synchronously in the producer/consumer path: it MUST NOT raise, MUST be
   ## cheap, MUST NOT block the chronos scheduler, and MUST NOT call back into the
-  ## client whose operation fired it.
+  ## client whose operation fired it. A `CatchableError` raised anyway drops the
+  ## event and is logged, rate-limited per client; a `Defect` is not caught.
   ##
   ## **Tag lifetime**: each `cstring` borrows a `string` that ends when the call
   ## returns — to retain tags past the call, copy each pair (e.g. via `$`) first.
@@ -159,6 +162,41 @@ const noTags*: array[0, (cstring, cstring)] = []
   ## Empty tag list: an emit site with nothing to report must not spell `[]`, which
   ## would convert to either `emitMetric` overload and make the call ambiguous.
 
+proc guardMetricsHook*(hook: MetricsHook): MetricsHook =
+  ## `hook` behind a CatchableError guard with its own report window, so one client's
+  ## failing hook does not hide another's. A failure drops the event. `nil` stays
+  ## `nil`, keeping `emitMetric` free for clients without a hook.
+  if hook == nil:
+    return nil
+  let failures = new CallbackFailureLog
+  result = proc(
+      event: cstring, tags: openArray[(cstring, cstring)], value: int64
+  ) {.closure, gcsafe, raises: [].} =
+    discard failures[].guardCallback("metricsHook", "dropped " & $event):
+      hook(event, tags, value)
+
+var unguardedHookFailures {.threadvar.}: CallbackFailureLog
+  ## Reports for hooks that reached `emitMetric` without `guardMetricsHook`, i.e. set
+  ## directly on a lower-level component. Shared by every such hook on the thread.
+
+proc invokeHook(
+    hook: MetricsHook,
+    event: MetricEvent,
+    tagPairs: openArray[(cstring, cstring)],
+    v: int64,
+) {.inline, gcsafe, raises: [].} =
+  ## Backstop for a hook that skipped `guardMetricsHook`: a leak would unwind through
+  ## the chronos dispatcher and abandon the coroutine that fired the event (the
+  ## connection readLoop among them). The event is dropped and the failure reported.
+  ## Unlike `guardCallback`, a completed call skips the threadvar, so a guarded hook
+  ## pays only for the `try`. A Defect stays fatal.
+  try:
+    hook(metricEventNames[event], tagPairs, v)
+  except CatchableError as e:
+    unguardedHookFailures.callbackRaised(
+      "metricsHook", e, "dropped " & $metricEventNames[event]
+    )
+
 template emitMetric*(
     hook: MetricsHook,
     event: MetricEvent,
@@ -170,7 +208,7 @@ template emitMetric*(
   ## inside the guard so they are not evaluated without a hook.
   let metricHook {.gensym.} = hook
   if metricHook != nil:
-    metricHook(metricEventNames[event], tagPairs, v)
+    invokeHook(metricHook, event, tagPairs, v)
 
 template emitMetric*(
     hook: MetricsHook,
@@ -188,4 +226,4 @@ template emitMetric*(
     var cstrTags {.gensym.} = newSeq[(cstring, cstring)](stableTags.len)
     for i in 0 ..< stableTags.len:
       cstrTags[i] = (cstring(stableTags[i][0]), cstring(stableTags[i][1]))
-    metricHook(metricEventNames[event], cstrTags, v)
+    invokeHook(metricHook, event, cstrTags, v)

@@ -84,6 +84,7 @@ suite "Facade exports":
     check declared(KafkaApiError)
     check declared(KafkaTimeoutError)
     check declared(KafkaClosedError)
+    check declared(KafkaRecordRejectedError)
     check declared(KafkaCommitError)
     check declared(KafkaCommitSkippedError)
     check declared(KafkaOffsetFetchError)

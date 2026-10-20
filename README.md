@@ -138,6 +138,13 @@ consume-process-produce loop commits the consumed offsets inside the same
 transaction; [`examples/transactions.nim`](examples/transactions.nim) is the
 complete program.
 
+Commit only after every `send` in the transaction has resolved. A failed `send`
+then leaves the transaction abort-only, and a cancelled one either still goes
+out with the commit or leaves it abort-only too, so a commit that succeeds never
+silently lacks the record. The exception is `KafkaRecordRejectedError` (a record
+over `maxBatchBytes`): the client refused that record before it touched the
+transaction, so the loop may skip it and still commit.
+
 ### TLS
 
 Certificate verification is ON by default; `skipVerify = true` disables it

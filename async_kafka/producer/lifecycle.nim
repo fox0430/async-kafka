@@ -254,7 +254,7 @@ proc newKafkaProducer*(
     fireAndForgetSem: newAsyncSemaphore(maxPendingFireAndForget),
     pendingRecordsSem: newAsyncSemaphore(maxPendingRecords),
     maxPendingRecords: maxPendingRecords,
-    metricsHook: metricsHook,
+    metricsHook: guardMetricsHook(metricsHook),
   )
 
 proc newKafkaProducer*(

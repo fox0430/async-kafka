@@ -7,7 +7,7 @@ import std/[tables, options, sets, strutils, importutils]
 
 import ../[async_backend, errors, broker, cluster]
 import ../protocol/messages
-import ../internal/[backoff, cancel, metrics, retry, safe_logging]
+import ../internal/[backoff, callback_guard, cancel, metrics, retry, safe_logging]
 
 import types, partitioner, idempotence, transaction, dlq
 
@@ -690,18 +690,20 @@ proc invokeErrorHandler(
 ): ErrorAction {.raises: [].} =
   ## Run the user `errorHandler` under a CatchableError guard: `ErrorHandler` is
   ## `raises: []`, but a buggy implementation can violate that, and a leaked exception
-  ## must not corrupt producer state. Logged once; the action falls back to `eaFail`.
-  try:
+  ## must not corrupt producer state. Falls back to `eaFail`; the metric counts every
+  ## failure, the log is rate-limited.
+  let raised = p.errorHandlerFailures.guardCallback(
+    "errorHandler", "falling back to eaFail"
+  ):
     result = p.errorHandler(failedRec)
-  except CatchableError as e:
-    warn "errorHandler raised " & $e.name & ": " & e.msg & " — falling back to eaFail"
+  if raised != nil:
     emitMetric(
       p.metricsHook,
       meProducerErrorHandlerException,
       [
         ("topic", failedRec.topic),
         ("partition", $failedRec.partition),
-        ("exception", $e.name),
+        ("exception", $raised.name),
       ],
       1,
     )
@@ -811,6 +813,27 @@ proc poisonTxnOnFailedBatch(
   else:
     if not p.tryTransition(tsError):
       warnTransitionFailed(p, tsError, "poisonTxnOnFailedBatch")
+
+proc poisonTxnOnUnjoinedSend(
+    p: KafkaProducer, txnSeq: int64, err: ref CatchableError
+) {.gcsafe, raises: [].} =
+  ## Poison the txn for a `send` that failed before its record joined, so a caller
+  ## swallowing the error cannot commit without it (a cancel included: the caller
+  ## cannot tell whether the record had joined). Only the txn the send was called in
+  ## (`txnSeq`), while still open or committing: the send still counts toward
+  ## `txnUnjoinedSends`, so a committing txn has not passed the post-flush guard yet.
+  ## An already poisoned one too, so a fatal error (PRODUCER_FENCED, say) still
+  ## escalates it to tsFatal; an abortable one leaves it as is.
+  if p.txnSeq != txnSeq:
+    return
+  if p.txnState in {tsInTransaction, tsCommitting, tsError}:
+    p.poisonTxnOnFailedBatch(err)
+
+proc leaveUnjoinedSend(p: KafkaProducer, txnSeq: int64) {.raises: [].} =
+  ## Drop a `send` from `txnUnjoinedSends` once its record joined or it failed. One
+  ## counted in an earlier txn is left out: `beginTransaction` reset the count.
+  if p.txnSeq == txnSeq:
+    dec p.txnUnjoinedSends
 
 proc removeInflightFlush(p: KafkaProducer, marker: Future[void]) {.raises: [].} =
   ## Remove a flushBatch in-flight marker (identity-based, O(n)); idempotent when absent.
@@ -1057,23 +1080,33 @@ proc renewLingerTimer*(p: KafkaProducer, tp: TopicPartition) {.gcsafe, raises: [
   p.lingerTimerEpoch[tp] = epoch
   p.lingerTimers[tp] = lingerTimeout(p, tp, epoch)
 
-proc assertBatchEnqueueable(p: KafkaProducer) {.raises: [KafkaError].} =
+proc sendTxnChange(p: KafkaProducer, txnSeq: int64): Option[string] {.raises: [].} =
+  ## Why the txn `send` was called in (`txnSeq`) can no longer take its record, or
+  ## `none` while it still can.
+  if p.txnState != tsInTransaction:
+    some("transaction state changed during send (now " & $p.txnState & ")")
+  elif p.txnSeq != txnSeq:
+    some("transaction changed during send (a later transaction is open)")
+  else:
+    none(string)
+
+proc assertBatchEnqueueable(p: KafkaProducer, txnSeq: int64) {.raises: [KafkaError].} =
   ## Re-check, under an already-held batchLock, that the producer still permits enqueueing a
   ## batched record; on failure it RELEASES the caller's pending-record permit and raises, so the
   ## caller's `finally` only releases the lock.
   ##
   ## Both guards must run in the SAME no-await region as the enqueue: past lsRunning enqueuing
   ## slips a record past failRemaining (leaking its future), past tsInTransaction it stays
-  ## invisible to a commit/abort snapshot until it lands in `p.batches`; if the same `tp` is
-  ## re-registered by the next txn, the record leaks into that one.
+  ## invisible to a commit/abort snapshot until it lands in `p.batches`; and once a later txn
+  ## is open (`txnSeq` moved on), the record would leak into that one.
   if p.state != lsRunning:
     p.releasePendingRecordPermit()
     raise newException(KafkaClosedError, "producer is closed")
-  if p.transactionalId.isSome and p.txnState != tsInTransaction:
-    p.releasePendingRecordPermit()
-    raise newException(
-      KafkaError, "transaction state changed during send (now " & $p.txnState & ")"
-    )
+  if p.transactionalId.isSome:
+    let changed = p.sendTxnChange(txnSeq)
+    if changed.isSome:
+      p.releasePendingRecordPermit()
+      raise newException(KafkaError, changed.get)
 
 proc appendPendingToBatchLocked(
     p: KafkaProducer, tp: TopicPartition, pm: PendingMessage
@@ -1134,6 +1167,13 @@ proc send*(
   ## Buffer one record for `topic` and resolve with its `ProduceResult` once acked. A negative
   ## `partition` selects via the configured strategy (key hash when keyed); oversized records
   ## raise before buffering. Inside a transaction the send joins it — commit only after it acked.
+  ## A send that fails before its record joins still poisons that transaction, so after a
+  ## failed or cancelled send (a timeout included) the commit either carries the record or is
+  ## refused; so is a commit made while the send has yet to join (one that `sendFireAndForget`
+  ## handed off while `maxPendingRecords` was full, say). The exception is
+  ## `KafkaRecordRejectedError` (an oversized record): the transaction stays committable, so
+  ## the caller may skip the record. The record never joins a later transaction begun while
+  ## the send awaited.
   ##
   ## A `none` value sends a tombstone (null value) for compacted topics; pair it
   ## with a key so the broker can match the key to delete. A nil `seq[byte]` passed
@@ -1143,6 +1183,38 @@ proc send*(
   ## `pstDropped`, `pstDeadLettered`, or `pstDeadLetterFailed` (with `offset = -1`) instead of
   ## `pstSuccess`.
   requireRunning(p)
+  # Before any await, so a send outside a txn fails as such, not as a replaced txn; and
+  # before the size check, so not as a rejection the caller may skip either.
+  if p.transactionalId.isSome and p.txnState != tsInTransaction:
+    raise newException(KafkaError, "must call beginTransaction before send")
+
+  let actualTimestamp = resolveTimestamp(timestamp)
+  let rec = Record(
+    offset: 0, timestamp: actualTimestamp, key: key, value: value, headers: headers
+  )
+  # Client-side validation runs before any await, so the caller sees size rejections
+  # without a metadata refresh, and no txn-poisoning failure or cancel can preempt them.
+  # Raised outside the try below, so the rejection itself never poisons the txn.
+  let recBytes = estimateRecordSize(rec)
+  if int64(recordBatchV2HeaderBytes) + int64(recBytes) > int64(p.maxBatchBytes):
+    raise newException(
+      KafkaRecordRejectedError,
+      "record estimated size " & $recBytes & " plus batch header " &
+        $recordBatchV2HeaderBytes & " exceeds maxBatchBytes " & $p.maxBatchBytes,
+    )
+
+  # Set while this send counts toward `txnUnjoinedSends`: from the txn check until its record
+  # joins. A failure meanwhile must poison the txn here (see poisonTxnOnUnjoinedSend).
+  let txnSeq = p.txnSeq
+  var unjoined = false
+  template leaveUnjoined() =
+    # Idempotent: drop this send from the count at most once.
+    if unjoined:
+      unjoined = false
+      p.leaveUnjoinedSend(txnSeq)
+
+  defer:
+    leaveUnjoined()
 
   # Transactional immediate-send (lingerMs <= 0) barrier marker: that path runs doSendWithRetry
   # outside txnLock, so without it a concurrent commit/abort could see no pending work and send
@@ -1154,218 +1226,219 @@ proc send*(
         txnMarker.complete()
       p.removeInflightFlush(txnMarker)
 
-  if p.transactionalId.isSome:
-    # A deferred epoch bump (broker still finalizing the prior txn) must be retried before this
-    # txn's first record, else AddPartitionsToTxn goes out with a stale producerEpoch and is fenced.
-    if p.pendingEpochBump:
-      await p.ensureEpochBumped()
+  try:
+    if p.transactionalId.isSome:
+      # Counted from here, so the commit cannot go through while this record may still join.
+      inc p.txnUnjoinedSends
+      unjoined = true
+      # A deferred epoch bump (broker still finalizing the prior txn) must be retried before this
+      # txn's first record, else AddPartitionsToTxn goes out with a stale producerEpoch and is fenced.
+      if p.pendingEpochBump:
+        await p.ensureEpochBumped()
+        requireRunning(p)
+        let changed = p.sendTxnChange(txnSeq)
+        if changed.isSome:
+          raise newException(KafkaError, changed.get)
+    elif p.enableIdempotence:
+      await p.ensureIdempotenceInitialized()
       requireRunning(p)
-    if p.txnState != tsInTransaction:
-      raise newException(KafkaError, "must call beginTransaction before send")
-  elif p.enableIdempotence:
-    await p.ensureIdempotenceInitialized()
-    requireRunning(p)
 
-  let actualTimestamp = resolveTimestamp(timestamp)
-  let rec = Record(
-    offset: 0, timestamp: actualTimestamp, key: key, value: value, headers: headers
-  )
-  # Client-side validation runs before partition resolution, so the caller sees size
-  # rejections without a metadata refresh.
-  let recBytes = estimateRecordSize(rec)
-  if int64(recordBatchV2HeaderBytes) + int64(recBytes) > int64(p.maxBatchBytes):
-    raise newException(
-      KafkaError,
-      "record estimated size " & $recBytes & " plus batch header " &
-        $recordBatchV2HeaderBytes & " exceeds maxBatchBytes " & $p.maxBatchBytes,
-    )
+    let part =
+      if partition >= 0:
+        # Range-check a caller-supplied partition against cached metadata only: an uncached
+        # topic would hit the broker (slow UNKNOWN_TOPIC_OR_PARTITION) while a cached one is
+        # rejected fast without a refresh (the auto-resolve path already refreshes).
+        let partsOpt = p.cluster.getTopicPartitionsCopy(topic)
+        # Not a KafkaRecordRejectedError: the cache may lag a topic that has since grown.
+        if partsOpt.isSome and partition >= int32(partsOpt.get.len):
+          raise newException(
+            KafkaError,
+            "partition " & $partition & " out of range for topic " & topic &
+              " (partitions: 0..<" & $partsOpt.get.len & ")",
+          )
+        partition
+      else:
+        let resolved = await p.resolvePartition(topic, key)
+        requireRunning(p)
+        resolved
 
-  let part =
-    if partition >= 0:
-      # Range-check a caller-supplied partition against cached metadata only: an uncached
-      # topic would hit the broker (slow UNKNOWN_TOPIC_OR_PARTITION) while a cached one is
-      # rejected fast without a refresh (the auto-resolve path already refreshes).
-      let partsOpt = p.cluster.getTopicPartitionsCopy(topic)
-      if partsOpt.isSome and partition >= int32(partsOpt.get.len):
-        raise newException(
-          KafkaError,
-          "partition " & $partition & " out of range for topic " & topic &
-            " (partitions: 0..<" & $partsOpt.get.len & ")",
-        )
-      partition
-    else:
-      let resolved = await p.resolvePartition(topic, key)
-      requireRunning(p)
-      resolved
+    let tp = TopicPartition(topic: topic, partition: part)
 
-  let tp = TopicPartition(topic: topic, partition: part)
+    if p.transactionalId.isSome:
+      # Hold txnLock from the state re-check through any AddPartitionsToTxn round-trip so a
+      # concurrent commit/abort can't tear down partition tracking between mark and register
+      # (txnLock is outermost, so awaiting the coordinator request nests no further).
+      await p.txnLock.acquire()
+      try:
+        let changed = p.sendTxnChange(txnSeq)
+        if changed.isSome:
+          raise newException(KafkaError, changed.get)
+        # Record whether this call added `tp` to the pending set, so a register failure
+        # rolls back only our own entry, not those from earlier sends.
+        let addedHere = tp notin p.txnPartitions and tp notin p.txnPendingPartitions
+        p.markPartitionForTxn(tp)
+        if p.lingerMs <= 0:
+          # Immediate send: register now; batched sends are registered by flushBatch.
+          try:
+            await p.registerPendingTxnPartitions()
+          except KafkaError as e:
+            if addedHere:
+              p.txnPendingPartitions.excl(tp)
+            raise e
+          requireRunning(p)
+          # Register the finalize barrier marker while still holding txnLock, so a later
+          # commit/abort calling awaitInflightFlushes is guaranteed to see it.
+          txnMarker = newFuture[void]("txnImmediateSend")
+          p.inflightFlushFutures.add(txnMarker)
+      finally:
+        p.txnLock.releaseSafely("producer.send.txn")
 
-  if p.transactionalId.isSome:
-    # Hold txnLock from the state re-check through any AddPartitionsToTxn round-trip so a
-    # concurrent commit/abort can't tear down partition tracking between mark and register
-    # (txnLock is outermost, so awaiting the coordinator request nests no further).
-    await p.txnLock.acquire()
-    try:
-      if p.txnState != tsInTransaction:
-        raise newException(
-          KafkaError, "transaction state changed during send (now " & $p.txnState & ")"
-        )
-      # Record whether this call added `tp` to the pending set, so a register failure
-      # rolls back only our own entry, not those from earlier sends.
-      let addedHere = tp notin p.txnPartitions and tp notin p.txnPendingPartitions
-      p.markPartitionForTxn(tp)
-      if p.lingerMs <= 0:
-        # Immediate send: register now; batched sends are registered by flushBatch.
+    if p.lingerMs <= 0:
+      let sem = p.getInflightSemaphore(tp)
+      await sem.acquire()
+      if p.state != lsRunning:
+        sem.releaseSafely("producer.send.inflight")
+        raise newException(KafkaClosedError, "producer is closed")
+      # Strict in-order completion gate (idempotence only); see flushBatch.
+      let gate =
+        if p.enableIdempotence:
+          CompletionGate()
+        else:
+          nil
+      var semReleased = false
+      template releaseInflightSem() =
+        # Idempotent: release the per-partition in-flight permit at most once.
+        if not semReleased:
+          semReleased = true
+          sem.releaseSafely("producer.releaseInflightSem")
+
+      let attemptCounter = AttemptCounter()
+      # Joined: from here doSendWithRetry and the cancel branch below poison the txn on a
+      # failure of this record.
+      leaveUnjoined()
+      try:
+        var pendingErr: ref KafkaError = nil
+        var sendErr: ref KafkaError = nil
         try:
-          await p.registerPendingTxnPartitions()
+          result =
+            await p.doSendWithRetry(tp, @[rec], actualTimestamp, gate, attemptCounter)
         except KafkaError as e:
-          if addedHere:
-            p.txnPendingPartitions.excl(tp)
-          # Poison before surfacing: registration failed, so this record can't join the
-          # txn; without the transition a caller swallowing the error could commit a txn
-          # silently missing it (the post-flush guard only fires on tsError/tsFatal).
+          sendErr = e
+        except CancelledError as e:
+          # doSendWithRetry's terminal transition only covers KafkaError, so poison here to keep a
+          # later commit from finalizing a txn missing this record (EOS).
           p.poisonTxnOnFailedBatch(e)
           raise e
-        requireRunning(p)
-        # Register the finalize barrier marker while still holding txnLock, so a later
-        # commit/abort calling awaitInflightFlushes is guaranteed to see it.
-        txnMarker = newFuture[void]("txnImmediateSend")
-        p.inflightFlushFutures.add(txnMarker)
-    finally:
-      p.txnLock.releaseSafely("producer.send.txn")
 
-  if p.lingerMs <= 0:
-    let sem = p.getInflightSemaphore(tp)
-    await sem.acquire()
-    if p.state != lsRunning:
-      sem.releaseSafely("producer.send.inflight")
-      raise newException(KafkaClosedError, "producer is closed")
-    # Strict in-order completion gate (idempotence only); see flushBatch.
-    let gate =
-      if p.enableIdempotence:
-        CompletionGate()
-      else:
-        nil
-    var semReleased = false
-    template releaseInflightSem() =
-      # Idempotent: release the per-partition in-flight permit at most once.
-      if not semReleased:
-        semReleased = true
-        sem.releaseSafely("producer.releaseInflightSem")
+        # Release the permit BEFORE failure handling or the completion-chain wait: holding it across
+        # `await gate.prev` would let a fast successor pin a slot while blocked on a slow predecessor.
+        releaseInflightSem()
 
-    let attemptCounter = AttemptCounter()
-    try:
-      var pendingErr: ref KafkaError = nil
-      var sendErr: ref KafkaError = nil
-      try:
-        result =
-          await p.doSendWithRetry(tp, @[rec], actualTimestamp, gate, attemptCounter)
-      except KafkaError as e:
-        sendErr = e
-      except CancelledError as e:
-        # doSendWithRetry's terminal transition only covers KafkaError, so poison here to keep a
-        # later commit from finalizing a txn missing this record (EOS).
-        p.poisonTxnOnFailedBatch(e)
-        raise e
+        if sendErr == nil and p.partitionStrategy == psSticky:
+          # A successful immediate send is its own completed "batch", so rotate the sticky partition
+          # as flushBatch does, else a keyless sticky send pins one partition forever; guard on the
+          # current value so a concurrent re-stick isn't clobbered.
+          p.stickyPartitions.withValue(tp.topic, idx):
+            if idx[] == tp.partition:
+              p.stickyPartitions.del(tp.topic)
 
-      # Release the permit BEFORE failure handling or the completion-chain wait: holding it across
-      # `await gate.prev` would let a fast successor pin a slot while blocked on a slow predecessor.
-      releaseInflightSem()
+        if sendErr != nil:
+          # Route every KafkaError subclass through handleSendFailure / DLQ, as the batched
+          # path does; catching only KafkaApiError would let transport errors bypass the DLQ.
+          let attempts = if attemptCounter.n > 0: attemptCounter.n else: 1'i32
+          let failedRec = makeFailedRecord(tp, rec, sendErr, attempts)
+          let handled = await p.handleSendFailure(failedRec)
+          if handled.isSome:
+            result = handled.get
+          else:
+            pendingErr = sendErr
 
-      if sendErr == nil and p.partitionStrategy == psSticky:
-        # A successful immediate send is its own completed "batch", so rotate the sticky partition
-        # as flushBatch does, else a keyless sticky send pins one partition forever; guard on the
-        # current value so a concurrent re-stick isn't clobbered.
-        p.stickyPartitions.withValue(tp.topic, idx):
-          if idx[] == tp.partition:
-            p.stickyPartitions.del(tp.topic)
-
-      if sendErr != nil:
-        # Route every KafkaError subclass through handleSendFailure / DLQ, as the batched
-        # path does; catching only KafkaApiError would let transport errors bypass the DLQ.
-        let attempts = if attemptCounter.n > 0: attemptCounter.n else: 1'i32
-        let failedRec = makeFailedRecord(tp, rec, sendErr, attempts)
-        let handled = await p.handleSendFailure(failedRec)
-        if handled.isSome:
-          result = handled.get
-        else:
-          pendingErr = sendErr
-
-      await awaitChainMarker(gate)
-      if pendingErr != nil:
-        raise pendingErr
-    finally:
-      # Release the next send in the completion chain only after our result is settled.
-      if gate != nil and not gate.mine.isNil and not gate.mine.finished:
-        gate.mine.complete()
-      # Backstop for the cancel path (release above skipped); no-op if released.
-      releaseInflightSem()
-      # Reclaim per-partition bookkeeping if this send left the partition idle; after the
-      # release above so the idle check sees a full permit count.
-      p.maybeEvictIdlePartitionState(tp)
-  else:
-    # Bound the cross-partition queue: each message holds one permit until its future resolves,
-    # acquired BEFORE batchLock so backpressure queues here rather than stalling the flush path.
-    await p.pendingRecordsSem.acquire()
-    if p.state != lsRunning:
-      p.releasePendingRecordPermit()
-      raise newException(KafkaClosedError, "producer is closed")
-
-    let fut = Future[ProduceResult].init("kafka.producer.send")
-    let pm = PendingMessage(record: rec, future: fut, tp: tp, estimatedBytes: recBytes)
-
-    var needsFlush = false
-    # If appending this record would push the in-progress batch (records + RecordBatch v2 header)
-    # past maxBatchBytes, SEAL it — flush first, then let the record open a fresh batch; matches
-    # Kafka Java's RecordAccumulator. A record over the cap on its own already raised at send()
-    # entry, so a fresh batch can never itself overflow: sealing suffices, the loop terminates.
-    # The check and append must share one synchronous batchLock region while startFlush suspends,
-    # so loop and re-check under the lock.
-    while true:
-      var sealFirst = false
-      try:
-        await p.batchLock.acquire()
-      except CancelledError:
-        p.releasePendingRecordPermit()
-        raise
-      try:
-        p.assertBatchEnqueueable()
-        let curBytes = p.pendingBatchBytes.getOrDefault(tp, 0'i64)
-        var curLen = 0
-        p.batches.withValue(tp, batch):
-          curLen = batch[].len
-        if curLen > 0 and
-            int64(recordBatchV2HeaderBytes) + curBytes + int64(pm.estimatedBytes) >
-            int64(p.maxBatchBytes):
-          sealFirst = true
-        else:
-          needsFlush = p.appendRecordLocked(tp, pm)
+        await awaitChainMarker(gate)
+        if pendingErr != nil:
+          raise pendingErr
       finally:
-        p.batchLock.releaseSafely("producer.releaseInflightSem.batchLock")
+        # Release the next send in the completion chain only after our result is settled.
+        if gate != nil and not gate.mine.isNil and not gate.mine.finished:
+          gate.mine.complete()
+        # Backstop for the cancel path (release above skipped); no-op if released.
+        releaseInflightSem()
+        # Reclaim per-partition bookkeeping if this send left the partition idle; after the
+        # release above so the idle check sees a full permit count.
+        p.maybeEvictIdlePartitionState(tp)
+    else:
+      # Bound the cross-partition queue: each message holds one permit until its future resolves,
+      # acquired BEFORE batchLock so backpressure queues here rather than stalling the flush path.
+      await p.pendingRecordsSem.acquire()
+      if p.state != lsRunning:
+        p.releasePendingRecordPermit()
+        raise newException(KafkaClosedError, "producer is closed")
 
-      if not sealFirst:
-        break
+      let fut = Future[ProduceResult].init("kafka.producer.send")
+      let pm =
+        PendingMessage(record: rec, future: fut, tp: tp, estimatedBytes: recBytes)
 
-      # flushBatch extracts the batch under batchLock BEFORE any broker await, so awaiting here
-      # guarantees it is gone from `p.batches` before the next iteration enqueues this record and
-      # the sealed batch keeps an earlier sequence. State may have advanced during the await
-      # (close / txn finalize), so the next iteration re-runs the guards.
-      await p.startFlush(tp)
+      var needsFlush = false
+      # If appending this record would push the in-progress batch (records + RecordBatch v2 header)
+      # past maxBatchBytes, SEAL it — flush first, then let the record open a fresh batch; matches
+      # Kafka Java's RecordAccumulator. A record over the cap on its own already raised at send()
+      # entry, so a fresh batch can never itself overflow: sealing suffices, the loop terminates.
+      # The check and append must share one synchronous batchLock region while startFlush suspends,
+      # so loop and re-check under the lock.
+      while true:
+        var sealFirst = false
+        try:
+          await p.batchLock.acquire()
+        except CancelledError:
+          p.releasePendingRecordPermit()
+          raise
+        try:
+          p.assertBatchEnqueueable(txnSeq)
+          let curBytes = p.pendingBatchBytes.getOrDefault(tp, 0'i64)
+          var curLen = 0
+          p.batches.withValue(tp, batch):
+            curLen = batch[].len
+          if curLen > 0 and
+              int64(recordBatchV2HeaderBytes) + curBytes + int64(pm.estimatedBytes) >
+              int64(p.maxBatchBytes):
+            sealFirst = true
+          else:
+            needsFlush = p.appendRecordLocked(tp, pm)
+            # Joined: the batch is the txn's now, and its flush poisons on failure.
+            leaveUnjoined()
+        finally:
+          p.batchLock.releaseSafely("producer.releaseInflightSem.batchLock")
 
-    if needsFlush:
-      # startFlush (not flushBatch): detach so a cancel of THIS caller can't fail co-located ones.
-      await p.startFlush(tp)
+        if not sealFirst:
+          break
 
-    try:
-      result = await fut
-    except CatchableError as e:
-      if e of CancelledError:
-        raise (ref CancelledError)(e)
-      if e of KafkaError:
-        # Preserve the dynamic KafkaError subtype so callers matching on it keep
-        # working through the batched-send future hop.
-        raise (ref KafkaError)(e)
-      raise newException(KafkaError, e.msg)
+        # flushBatch extracts the batch under batchLock BEFORE any broker await, so awaiting here
+        # guarantees it is gone from `p.batches` before the next iteration enqueues this record and
+        # the sealed batch keeps an earlier sequence. State may have advanced during the await
+        # (close / txn finalize), so the next iteration re-runs the guards.
+        await p.startFlush(tp)
+
+      if needsFlush:
+        # startFlush (not flushBatch): detach so a cancel of THIS caller can't fail co-located ones.
+        await p.startFlush(tp)
+
+      try:
+        result = await fut
+      except CatchableError as e:
+        if e of CancelledError:
+          raise (ref CancelledError)(e)
+        if e of KafkaError:
+          # Preserve the dynamic KafkaError subtype so callers matching on it keep
+          # working through the batched-send future hop.
+          raise (ref KafkaError)(e)
+        raise newException(KafkaError, e.msg)
+  except CancelledError as e:
+    if unjoined:
+      p.poisonTxnOnUnjoinedSend(txnSeq, e)
+    raise e
+  except KafkaError as e:
+    if unjoined:
+      p.poisonTxnOnUnjoinedSend(txnSeq, e)
+    raise e
 
 proc send*(
     p: KafkaProducer,
@@ -1527,6 +1600,14 @@ proc runEndTxn(
         KafkaError,
         "cannot commit: a buffered send failed during flush (state: " & $p.txnState & ")",
       )
+    if committed and p.txnUnjoinedSends > 0:
+      # A send of this txn is still short of joining it (waiting on backpressure, txnLock or
+      # metadata) and no longer can: committing would finalize the txn without its record.
+      raise newException(
+        KafkaError,
+        "cannot commit: " & $p.txnUnjoinedSends &
+          " send(s) of this transaction have not joined it",
+      )
     if not p.txnStarted:
       # Nothing reached the coordinator, so its metadata is still `Empty` and EndTxn would be
       # rejected with INVALID_TXN_STATE; finalize locally (Java's empty-transaction short-circuit).
@@ -1582,8 +1663,9 @@ proc commitTransaction*(
     p: KafkaProducer
 ) {.async: (raises: [KafkaError, CancelledError]).} =
   ## Flush buffered sends, send `EndTxn(commit)`, and settle the deferred epoch
-  ## bump. Refuses — raising without committing — when a buffered send failed
-  ## or the transaction is poisoned, so a commit never finalizes missing records.
+  ## bump. Refuses — raising without committing — when a buffered send failed,
+  ## a send has yet to join the transaction, or the transaction is poisoned, so a
+  ## commit never finalizes missing records.
   # Resolve any deferred epoch bump BEFORE taking txnLock (lock order: txnLock outermost): a
   # zero-send transaction would otherwise send EndTxn with a stale producerEpoch and be fenced.
   await p.ensureEpochBumped()
@@ -1708,19 +1790,26 @@ proc sendFireAndForget*(
 ) {.async: (raises: [CancelledError, KafkaClosedError]).} =
   ## Send without awaiting the ack: the result (or failure) goes to `callback`,
   ## or to the logs when `callback` is nil. Returns once the send is handed to
-  ## the pipeline, not once it is acked; `close` drains handed-off sends.
+  ## the pipeline, not once it is acked; `close` drains handed-off sends. Inside
+  ## a transaction, commit only once `callback` ran. A commit made after this
+  ## returned, while the send has yet to join the transaction, is refused; one
+  ## made while the call still waits for a `maxPendingFireAndForget` slot is not,
+  ## as nothing was handed off yet.
   ## A `none` value sends a tombstone (null value) for compacted topics. A nil
   ## `seq[byte]` passed to the `seq[byte]` overload stays an empty value.
   proc invokeCallback(res: ProduceResult, err: ref KafkaError) {.raises: [].} =
-    if callback != nil:
-      # ProduceCallback is `raises: []` but a buggy implementation can violate that; a
-      # leaked exception must not kill task()'s finally (the semaphore release).
-      try:
-        callback(res, err)
-      except CatchableError as e:
-        warn "sendFireAndForget callback raised " & $e.name & ": " & e.msg
-    elif err != nil:
-      warn "sendFireAndForget error (no callback): ", err.msg
+    if callback == nil:
+      if err != nil:
+        warn "sendFireAndForget error (no callback): ", err.msg
+      return
+    # ProduceCallback is `raises: []` but a buggy implementation can violate that; a
+    # leaked exception must not kill task()'s finally (the semaphore release).
+    let raised = p.produceCallbackFailures.guardCallback(
+      "sendFireAndForget callback", ""
+    ):
+      callback(res, err)
+    if raised != nil and err != nil:
+      warn "sendFireAndForget error (callback raised): ", err.msg
 
   await p.fireAndForgetSem.acquire()
 

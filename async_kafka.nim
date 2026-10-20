@@ -66,6 +66,7 @@ export
   errors.KafkaApiError,
   errors.KafkaTimeoutError,
   errors.KafkaClosedError,
+  errors.KafkaRecordRejectedError,
   errors.PartitionCommitError,
   errors.KafkaCommitError,
   errors.KafkaCommitSkippedError,

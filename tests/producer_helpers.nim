@@ -195,6 +195,22 @@ proc setPendingEpochBump*(p: KafkaProducer, value: bool) =
   ## bumpEpoch deferred" state without driving the full InitProducerId failure.
   p.pendingEpochBump = value
 
+proc holdEpochBumpGate*(p: KafkaProducer) =
+  ## Test helper. Mark a deferred bump as in flight, so ensureEpochBumped callers
+  ## park on its gate until `releaseEpochBumpGate`.
+  p.pendingEpochBump = true
+  p.epochBumpInflight = true
+  p.epochBumpDone = newFuture[void]("tests.helpers.epochBump")
+
+proc releaseEpochBumpGate*(p: KafkaProducer) =
+  ## Test helper. Finish a bump held by `holdEpochBumpGate`, as a successful one does.
+  let done = p.epochBumpDone
+  p.pendingEpochBump = false
+  p.epochBumpInflight = false
+  p.epochBumpDone = nil
+  if done != nil and not done.finished:
+    done.complete()
+
 proc inflightSemaphoreCount*(p: KafkaProducer): int =
   ## Test helper. Number of entries in the inflightSemaphores table. Verifies
   ## close() clears the per-partition tracking instead of letting it grow

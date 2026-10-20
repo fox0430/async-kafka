@@ -1,5 +1,6 @@
 import std/[unittest, options, tables, importutils]
-from std/strutils import contains
+import std/logging as stdLogging
+from std/strutils import contains, join
 from std/times import epochTime
 
 from async_kafka/connection import newTlsConfig, newHostAllowlist, allowHost
@@ -10,6 +11,7 @@ import chronos
 import async_kafka/[errors, cluster, broker]
 import async_kafka/protocol/[messages, api_keys, primitives]
 import async_kafka/consumer/[consumer, fetcher, group, assignment]
+import async_kafka/internal/metrics
 import async_kafka/producer/producer as kafkaProducer
 import
   fake_broker, consumer_helpers, cluster_helpers, async_helpers, fetcher_helpers,
@@ -20,6 +22,10 @@ import
 privateAccess(FetchedRecord)
 
 type
+  ConsumerLogSink = ref object of stdLogging.Logger
+    messages: seq[string]
+    levels: seq[stdLogging.Level]
+
   RebalanceProbe = ref object
     ## Counts the requests a coordinator fake-broker sees so a test can assert
     ## that a transient OffsetFetch failure retried only the offset fetch and
@@ -36,6 +42,13 @@ type
     offsetFetchCount: int
     offsetCommitCount: int
     findCoordinatorCount: int
+
+method log(
+    logger: ConsumerLogSink, level: stdLogging.Level, args: varargs[string, `$`]
+) {.gcsafe.} =
+  ## Captures the diagnostics an application handler would have printed.
+  logger.messages.add(args.join(""))
+  logger.levels.add(level)
 
 suite "Consumer: lifecycle state":
   test "fresh consumer is in lsUninitialized state":
@@ -4214,6 +4227,342 @@ suite "Consumer: commitAsync offset snapshot (Java parity)":
 
     waitFor testBody()
 
+  test "a callback that leaks an exception on a closed consumer does not escape":
+    ## Regression: commitAsync invoked the callback without a CatchableError
+    ## guard, so a callback leaking an exception through `{.cast(raises: []).}`
+    ## broke the never-raises contract on the caller's coroutine.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let c = newKafkaConsumer(config, cluster)
+      c.markClosed()
+
+      var calls = 0
+      proc cb(err: ref KafkaError) {.gcsafe, raises: [].} =
+        inc calls
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional callback bug")
+
+      let logger = ConsumerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        c.commitAsync(cb)
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+      check calls == 1
+      check logger.messages.len == 2
+      check "commitAsync callback raised ValueError: intentional callback bug" in
+        logger.messages[0]
+      # The commit error the callback was handed must not vanish with it.
+      check "commitAsync error (callback raised): consumer is closed" in
+        logger.messages[1]
+
+      await cluster.close()
+
+    waitFor testBody()
+
+  test "a callback that leaks an exception logs a non-retriable commit error at error":
+    ## The commit error the broken callback was handed is logged as on the
+    ## no-callback path, at error when non-retriable, so alerting on error-level
+    ## logs still catches a commit that keeps failing once the callback broke.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let c = newKafkaConsumer(config, cluster)
+
+      proc cb(err: ref KafkaError) {.gcsafe, raises: [].} =
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional callback bug")
+
+      let logger = ConsumerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        c.reportCommitResultForTest(
+          cb, newKafkaApiError(keGroupAuthorizationFailed, "group authorization failed")
+        )
+        c.reportCommitResultForTest(
+          cb, newKafkaApiError(keCoordinatorLoadInProgress, "coordinator loading")
+        )
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+      # The second callback failure falls in the first one's report window.
+      check logger.levels ==
+        @[stdLogging.lvlWarn, stdLogging.lvlError, stdLogging.lvlWarn]
+      check "commitAsync non-retriable error (callback raised): group authorization failed" in
+        logger.messages[1]
+      check "commitAsync error (callback raised): coordinator loading" in
+        logger.messages[2]
+
+      await cluster.close()
+
+    waitFor testBody()
+
+  test "a non-retriable error behind a retriable first partition logs at error":
+    ## A KafkaCommitError's errorCode is only its first failed partition, so a
+    ## retriable one there hid a non-retriable partition behind it at warn.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let c = newKafkaConsumer(config, cluster)
+
+      proc cb(err: ref KafkaError) {.gcsafe, raises: [].} =
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional callback bug")
+
+      let err = newKafkaCommitError(
+        keRebalanceInProgress,
+        "OffsetCommit error for t-0: REBALANCE_IN_PROGRESS (and 1 more error(s))",
+        @[
+          PartitionCommitError(
+            topic: "t", partition: 0'i32, errorCode: keRebalanceInProgress
+          ),
+          PartitionCommitError(
+            topic: "u", partition: 0'i32, errorCode: keTopicAuthorizationFailed
+          ),
+        ],
+      )
+      let logger = ConsumerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        c.reportCommitResultForTest(cb, err)
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+      check logger.levels == @[stdLogging.lvlWarn, stdLogging.lvlError]
+
+      await cluster.close()
+
+    waitFor testBody()
+
+  test "a cancelled commit without a callback is logged":
+    ## Regression: the commit task's cancel branch only reported to a callback, so
+    ## without one an interrupted commit left no trace of whether it landed.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let c = newKafkaConsumer(config, cluster)
+      c.markRunning()
+
+      let tp = TopicPartition(topic: "t", partition: 0)
+      let f = c.fetcherForTest()
+      f.registerPartitionForTest(tp, 0)
+      f.advanceConsumedOffset(
+        FetchedRecord(topic: "t", partition: 0'i32, offset: 4'i64)
+      )
+
+      # Park the commit task on the lock, then cancel it there.
+      await c.acquireCommitLockForTest()
+      let logger = ConsumerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        c.commitAsync()
+        for fut in c.pendingCommitsForTest():
+          await fut.cancelAndWait()
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+        c.releaseCommitLockForTest()
+      check logger.messages == @["commitAsync error (no callback): commit cancelled"]
+      check logger.levels == @[stdLogging.lvlWarn]
+
+      await c.close()
+      await cluster.close()
+
+    waitFor testBody()
+
+  test "close warns once for a commit without a callback it cancels":
+    ## close() warns only when a drained commit ends cancelled, which this task never
+    ## does: it absorbs the cancel, so `wait` returns instead of timing out. The
+    ## task's own warn is then the one report, not a second one.
+    proc testBody() {.async: (raises: [Exception]).} =
+      var config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      config.sessionTimeoutMs = 2000'i32 # drain budget = max(2000 - 1000, 2000) = 2000ms
+      config.heartbeatIntervalMs = 500'i32 # must be < sessionTimeoutMs
+      let cluster =
+        newCluster(@["127.0.0.1:1"], connectTimeoutMs = 50, requestTimeoutMs = 50)
+      let c = newKafkaConsumer(config, cluster)
+      c.markRunning()
+
+      let tp = TopicPartition(topic: "t", partition: 0)
+      let f = c.fetcherForTest()
+      f.registerPartitionForTest(tp, 0)
+      f.advanceConsumedOffset(
+        FetchedRecord(topic: "t", partition: 0'i32, offset: 4'i64)
+      )
+
+      # Held, so the commit task parks until close() gives up on it.
+      await c.acquireCommitLockForTest()
+      let logger = ConsumerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        c.commitAsync()
+        let pending = c.pendingCommitsForTest()
+        check pending.len == 1
+        let closeFut = c.close()
+        let deadline = Moment.now() + 5.seconds
+        while not pending[0].finished and Moment.now() < deadline:
+          await sleepAsync(milliseconds(1))
+        check pending[0].finished
+        # Released only now, so the final commit in close() does not wait on it.
+        c.releaseCommitLockForTest()
+        await closeFut
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+      var commitWarns = 0
+      for i, msg in logger.messages:
+        if "commitAsync" in msg and logger.levels[i] >= stdLogging.lvlWarn:
+          inc commitWarns
+      check commitWarns == 1
+      check "commitAsync error (no callback): commit cancelled" in logger.messages
+
+      await cluster.close()
+
+    waitFor testBody()
+
+  test "a non-retriable partition commit error logs at error without a callback":
+    ## Regression: the broker rejects a commit per partition, so the rejection
+    ## arrives as KafkaCommitError, whose no-callback branch always logged at warn;
+    ## only the plain KafkaError branch picked error for a non-retriable code.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let fb = newFakeBroker()
+      let port = int32(fb.address().port)
+
+      proc handler() {.async: (raises: []).} =
+        try:
+          let av = await fb.nextRequest(timeout = 2.seconds)
+          try:
+            await av.respond(
+              buildApiVersionsResponseBody(
+                0'i16,
+                [
+                  FakeApiVersion(
+                    apiKey: int16(ord(akApiVersions)), minVersion: 0, maxVersion: 0
+                  ),
+                  FakeApiVersion(
+                    apiKey: int16(ord(akOffsetCommit)), minVersion: 0, maxVersion: 3
+                  ),
+                ],
+              )
+            )
+          except CatchableError:
+            discard
+          let oc = await fb.nextRequest(timeout = 2.seconds)
+          try:
+            await oc.respond(
+              buildOffsetCommitResponseBodyV3(
+                topic = "t",
+                partition = 0'i32,
+                errorCode = int16(ord(keTopicAuthorizationFailed)),
+              )
+            )
+          except CatchableError:
+            discard
+        except CatchableError:
+          discard
+
+      let handlerFut = handler()
+
+      let config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let c = newKafkaConsumer(config, cluster)
+      c.markRunning()
+
+      let coord = newBroker(0'i32, "127.0.0.1", port, "coord")
+      c.setGroupCoordinatorForTest(coord)
+      c.setGroupGenerationForTest(7'i32)
+
+      let tp = TopicPartition(topic: "t", partition: 0)
+      let f = c.fetcherForTest()
+      f.registerPartitionForTest(tp, 0)
+      f.advanceConsumedOffset(
+        FetchedRecord(topic: "t", partition: 0'i32, offset: 4'i64)
+      )
+      f.bumpGeneration(7'i32)
+
+      let logger = ConsumerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        c.commitAsync()
+        for fut in c.pendingCommitsForTest():
+          awaitDrain(fut, 2.seconds)
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+      awaitDrain(handlerFut, 2.seconds)
+
+      var commitAsyncLevels: seq[stdLogging.Level]
+      for i, msg in logger.messages:
+        if "commitAsync" in msg:
+          commitAsyncLevels.add(logger.levels[i])
+      check commitAsyncLevels == @[stdLogging.lvlError]
+
+      # Drop the coordinator so close()'s final commit short-circuits instead of
+      # re-hitting the now-idle fake broker.
+      c.setGroupCoordinatorForTest(nil)
+      await c.close()
+      await coord.close()
+      await fb.close()
+      await cluster.close()
+
+    waitFor testBody()
+
+  test "a callback that leaks an exception in the commit task is contained":
+    ## Same guard on the spawned task: the leak used to unwind through the chronos
+    ## dispatcher into whoever drove the event loop, leaving the task unfinished.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let c = newKafkaConsumer(config, cluster)
+      c.markRunning()
+
+      var calls = 0
+      proc cb(err: ref KafkaError) {.gcsafe, raises: [].} =
+        inc calls
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional callback bug")
+
+      # Nothing consumed: the commit is a no-op that completes with callback(nil).
+      c.commitAsync(cb)
+      let pending = c.pendingCommitsForTest()
+      check pending.len == 1
+      await allFutures(pending)
+      check pending[0].completed()
+      check calls == 1
+
+      await c.close()
+      await cluster.close()
+
+    waitFor testBody()
+
   test "does not raise synchronously when closed and no callback is given":
     ## The no-callback closed path mirrors the in-task no-callback error
     ## handling: log and return, never raise on the caller's coroutine.
@@ -5679,3 +6028,44 @@ suite "Consumer normal path end to end":
       awaitDrain(h, 1.seconds)
 
     waitFor body()
+
+suite "Consumer: metrics hook guard":
+  test "a consumer and the cluster it builds report hook failures separately":
+    ## Regression: one threadvar held the report window for every hook on the
+    ## thread, so while one client's hook kept failing another's failure was only
+    ## counted, never named. Each client now guards the hook it was given, the
+    ## consumer and the Cluster it builds included.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let hook: MetricsHook = proc(
+          event: cstring, tags: openArray[(cstring, cstring)], value: int64
+      ) {.gcsafe, raises: [].} =
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional hook bug")
+      var config = initConsumerConfig(
+        bootstrapBrokers = @["127.0.0.1:1"], groupId = "g", topics = @["t"]
+      )
+      config.metricsHook = hook
+      # Two of each: a hook that skipped its guard would share the emit backstop's
+      # report window with the other one, and show up once between them.
+      let consumers = [newKafkaConsumer(config), newKafkaConsumer(config)]
+
+      let logger = ConsumerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        for c in consumers:
+          for stored in c.metricsHooksForTest():
+            emitMetric(stored, meConsumerFetchRecords, noTags, 1)
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+      # One report per client.
+      check logger.messages.len == 4
+      for msg in logger.messages:
+        check "intentional hook bug" in msg
+
+      for c in consumers:
+        await c.close()
+
+    waitFor testBody()

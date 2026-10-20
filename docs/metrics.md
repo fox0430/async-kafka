@@ -34,7 +34,12 @@ tag key that exists on only one side fails that test.
   call returns. Copy each pair (e.g. with `$`) before retaining it in an async
   sink or a background queue.
 - The hook runs synchronously on the client's hot path: it must not raise,
-  block, or do non-trivial work.
+  block, or do non-trivial work. A `CatchableError` that escapes anyway drops
+  the event; failures are logged at `warn` at most once a minute for each
+  producer, consumer, and `Cluster` the hook was given to, and the count of
+  those dropped in between is reported by the first call of the hook once the
+  minute is up, whether that call fails or not. A `Defect` (such as an
+  `IndexDefect` from a bug in the hook) is not caught and stays fatal.
 
 ## Installing a hook
 

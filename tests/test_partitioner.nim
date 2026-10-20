@@ -1,4 +1,4 @@
-import std/[unittest, tables, options, importutils]
+import std/[unittest, tables, options, importutils, strutils]
 
 import chronos
 
@@ -170,5 +170,68 @@ suite "resolvePartition: empty-key semantics (Java compatibility)":
       for _ in 0 ..< 5:
         check (await p.resolvePartition("t", none(seq[byte]))) == first
       check p.getStickyPartition("t") == some(first)
+
+    waitFor body()
+
+suite "resolvePartition: custom partitioner exception guard":
+  ## Regression: resolvePartition called the user CustomPartitioner without a
+  ## CatchableError guard (asymmetric with invokeErrorHandler). A partitioner
+  ## leaking an exception through `{.cast(raises: []).}` escaped send's
+  ## `raises: [KafkaError, CancelledError]`; it now fails the send instead.
+
+  test "a partitioner that leaks an exception fails with KafkaError":
+    proc body() {.async: (raises: [Exception]).} =
+      let cluster = newCluster(@["127.0.0.1:9092"])
+      seedPartitions(cluster, "t", 3)
+      proc buggy(
+          topic: string, key: Option[seq[byte]], partitionCount: int32
+      ): int32 {.closure, gcsafe, raises: [].} =
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional partitioner bug")
+
+      let p = newKafkaProducer(cluster, customPartitioner = buggy)
+      var raised: ref KafkaError = nil
+      try:
+        discard await p.resolvePartition("t", none(seq[byte]))
+      except KafkaError as e:
+        raised = e
+      check raised != nil
+      check "custom partitioner raised ValueError" in raised.msg
+      check "intentional partitioner bug" in raised.msg
+      # Kept as the parent so the user's own stack trace is not lost.
+      check raised.parent of ValueError
+
+    waitFor body()
+
+  test "a leaked KafkaError or CancelledError is wrapped like any other":
+    ## A raise is a bug, not a way to signal: kept as-is, a partitioner could pass
+    ## for a broker error, or end a send nobody cancelled as cancelled.
+    proc body() {.async: (raises: [Exception]).} =
+      let cluster = newCluster(@["127.0.0.1:9092"])
+      seedPartitions(cluster, "t", 3)
+      var leak: ref CatchableError
+      proc leaky(
+          topic: string, key: Option[seq[byte]], partitionCount: int32
+      ): int32 {.closure, gcsafe, raises: [].} =
+        {.cast(raises: []).}:
+          raise leak
+
+      let p = newKafkaProducer(cluster, customPartitioner = leaky)
+      for leaked in [
+        (ref CatchableError)(
+          newException(KafkaTimeoutError, "intentional partitioner timeout")
+        ),
+        newException(CancelledError, "intentional partitioner cancel"),
+      ]:
+        leak = leaked
+        var raised: ref KafkaError = nil
+        try:
+          discard await p.resolvePartition("t", none(seq[byte]))
+        except KafkaError as e:
+          raised = e
+        check raised != nil
+        check not (raised of KafkaTimeoutError)
+        check raised.parent == leaked
+        check ("custom partitioner raised " & $leaked.name) in raised.msg
 
     waitFor body()

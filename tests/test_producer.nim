@@ -1,10 +1,12 @@
 import std/[unittest, tables, options, strutils, importutils]
+import std/logging as stdLogging
 from std/times import epochTime
 
 import chronos
 
 import async_kafka/[errors, broker]
 import async_kafka/cluster {.all.}
+import async_kafka/internal/metrics
 import async_kafka/protocol/[messages, primitives, api_keys, compression]
 import async_kafka/protocol/lz4 as lz4mod
 import async_kafka/producer/producer
@@ -20,6 +22,15 @@ privateAccess(KafkaProducer)
 import fake_broker, producer_helpers, producer_internal_helpers, async_helpers
 
 privateAccess(Cluster)
+
+type ProducerLogSink = ref object of stdLogging.Logger
+  messages: seq[string]
+
+method log(
+    logger: ProducerLogSink, level: stdLogging.Level, args: varargs[string, `$`]
+) {.gcsafe.} =
+  ## Captures the diagnostics an application handler would have printed.
+  logger.messages.add(args.join(""))
 
 suite "Producer: close guard":
   test "send after close raises KafkaError":
@@ -2658,22 +2669,41 @@ suite "Producer: sendFireAndForget callback exception guard":
         {.cast(raises: []).}:
           raise newException(ValueError, "intentional callback bug")
 
-      await p.sendFireAndForget("t", @[0x01'u8], callback = cb)
-
-      # The callback runs in the background task; wait for it to settle. The
-      # tracked list is compacted lazily (only on the next sendFireAndForget),
-      # so count unfinished futures directly.
-      let deadline = Moment.now() + 3.seconds
+      let logger = ProducerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
       var unfinished = 1
-      while unfinished > 0 and Moment.now() < deadline:
-        unfinished = 0
-        for fut in p.pendingFireAndForget:
-          if not fut.finished:
-            inc unfinished
-        if unfinished > 0:
-          await sleepAsync(milliseconds(10))
+      try:
+        await p.sendFireAndForget("t", @[0x01'u8], callback = cb)
+
+        # The callback runs in the background task; wait for it to settle. The
+        # tracked list is compacted lazily (only on the next sendFireAndForget),
+        # so count unfinished futures directly.
+        let deadline = Moment.now() + 3.seconds
+        while unfinished > 0 and Moment.now() < deadline:
+          unfinished = 0
+          for fut in p.pendingFireAndForget:
+            if not fut.finished:
+              inc unfinished
+          if unfinished > 0:
+            await sleepAsync(milliseconds(10))
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
       check unfinished == 0
       check callbackRan
+      # The send error the callback was handed is still logged, as with no callback.
+      var reported, fallback = false
+      for msg in logger.messages:
+        if msg.startsWith(
+          "sendFireAndForget callback raised ValueError: intentional callback bug"
+        ):
+          reported = true
+        if msg.startsWith("sendFireAndForget error (callback raised): "):
+          fallback = true
+      check reported
+      check fallback
 
       await p.close()
       await cluster.close()
@@ -2806,6 +2836,497 @@ suite "Producer: transactional send failure transitions":
 
   test "ecNeedsProducerIdReset (UNKNOWN_PRODUCER_ID) -> tsError, no reset in txn":
     waitFor runTxnProduceFailureCase(tsError, 59'i16)
+
+proc newJoinTestProducer(
+    partitioner: CustomPartitioner = nil,
+    lingerMs = 0'i32,
+    maxPendingRecords = 10_000'i32,
+): KafkaProducer =
+  ## A transactional producer mid-transaction, over a cluster that already knows topic
+  ## "t" (3 partitions), so resolving a partition never reaches a broker.
+  let cluster = newCluster(@["127.0.0.1:9092"])
+  for i in 0'i32 ..< 3'i32:
+    cluster.topicPartitions.mgetOrPut("t", @[]).add(
+      PartitionMeta(partitionIndex: i, leaderId: 0, errorCode: keNone)
+    )
+  cluster.lastMetadataRefresh = Moment.now()
+  result = newKafkaProducer(
+    cluster,
+    transactionalId = some("test-txn"),
+    enableIdempotence = true,
+    customPartitioner = partitioner,
+    lingerMs = lingerMs,
+    maxPendingRecords = maxPendingRecords,
+  )
+  result.setTxnState(tsInTransaction)
+
+suite "Producer: a send failing before its record joins the txn":
+  ## Regression: only a failed partition registration poisoned the txn, so most
+  ## failures before the record joined (oversized record, partitioner, a cancel
+  ## while waiting for txnLock) left a txn that a caller swallowing the error could
+  ## commit without the record. Send now poisons on any of them, but only the txn it
+  ## was called in: one begun while it awaited never held the record. An oversized
+  ## record (KafkaRecordRejectedError) is the exception: it could never be sent, so
+  ## the caller may skip it and still commit.
+
+  test "a partitioner failure poisons the open transaction":
+    proc body() {.async: (raises: [Exception]).} =
+      var leaks = true
+      proc partitioner(
+          topic: string, key: Option[seq[byte]], partitionCount: int32
+      ): int32 {.closure, gcsafe, raises: [].} =
+        if leaks:
+          {.cast(raises: []).}:
+            raise newException(ValueError, "intentional partitioner bug")
+        partitionCount # out of range
+
+      for leak in [true, false]:
+        leaks = leak
+        let p = newJoinTestProducer(partitioner)
+        var raised = false
+        try:
+          discard await p.send("t", @[1'u8])
+        except KafkaError:
+          raised = true
+        check raised
+        check p.txnState == tsError
+        await p.close()
+
+    waitFor body()
+
+  test "an oversized record leaves the transaction committable":
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      var msg = ""
+      try:
+        discard await p.send("t", newSeq[byte](2_000_000))
+      except KafkaRecordRejectedError as e:
+        msg = e.msg
+      check "exceeds maxBatchBytes" in msg
+      check p.txnState == tsInTransaction
+      await p.close()
+
+    waitFor body()
+
+  test "an oversized record is rejected before waiting on a deferred epoch bump":
+    ## Regression: the size check ran after the bump's await, so a cancel or bump
+    ## failure there preempted the rejection and poisoned the txn.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      p.holdEpochBumpGate()
+      let fut = p.send("t", newSeq[byte](2_000_000))
+      check fut.failed()
+      p.releaseEpochBumpGate()
+      var rejected = false
+      try:
+        discard await fut
+      except KafkaRecordRejectedError:
+        rejected = true
+      check rejected
+      check p.txnState == tsInTransaction
+      await p.close()
+
+    waitFor body()
+
+  test "a partition the cached metadata rules out poisons the open transaction":
+    ## Not a KafkaRecordRejectedError: the cache may lag a topic that has since
+    ## grown, so the record may be valid and skipping it would lose it.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      var msg = ""
+      var rejected = false
+      try:
+        discard await p.send("t", @[1'u8], partition = 5)
+      except KafkaRecordRejectedError:
+        rejected = true
+      except KafkaError as e:
+        msg = e.msg
+      check not rejected
+      check "out of range for topic t" in msg
+      check p.txnState == tsError
+      await p.close()
+
+    waitFor body()
+
+  test "a send made before beginTransaction is refused as such":
+    ## Regression: the state was checked only after a deferred epoch bump, so a
+    ## beginTransaction during it let the send fail as if its txn had been replaced.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      p.setTxnState(tsReady)
+      p.holdEpochBumpGate()
+      let fut = p.send("t", @[1'u8])
+      p.beginTransaction()
+      p.releaseEpochBumpGate()
+      var msg = ""
+      try:
+        discard await fut
+      except KafkaError as e:
+        msg = e.msg
+      check msg == "must call beginTransaction before send"
+      check p.txnState == tsInTransaction
+      await p.close()
+
+    waitFor body()
+
+  test "an oversized record sent outside a transaction is refused as such":
+    ## Regression: the size check ran first, so the send failed with a rejection the
+    ## caller may skip and still commit, hiding that no transaction was open.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      p.setTxnState(tsReady)
+      var msg = ""
+      var rejected = false
+      try:
+        discard await p.send("t", newSeq[byte](2_000_000))
+      except KafkaRecordRejectedError:
+        rejected = true
+      except KafkaError as e:
+        msg = e.msg
+      check not rejected
+      check msg == "must call beginTransaction before send"
+      await p.close()
+
+    waitFor body()
+
+  test "a fatal registration error escalates a transaction already poisoned":
+    ## Regression: a send failing before its record joined poisoned only an open or
+    ## committing txn, so a PRODUCER_FENCED registration reply arriving after a
+    ## concurrent failure had set tsError left the producer abortable, not fatal.
+    proc body() {.async: (raises: [Exception]).} =
+      let fb = newFakeBroker()
+      let b = newBroker(0'i32, "127.0.0.1", int32(fb.address().port), "fenced-reg")
+      let p = newJoinTestProducer()
+      p.setTxnCoordinator(b)
+      p.setProducerId(42, 0)
+
+      proc handler() {.async: (raises: []).} =
+        try:
+          let av = await fb.nextRequest(timeout = 2.seconds)
+          await av.respond(
+            buildApiVersionsResponseBody(
+              0'i16,
+              [
+                FakeApiVersion(
+                  apiKey: int16(ord(akApiVersions)), minVersion: 0, maxVersion: 0
+                ),
+                FakeApiVersion(
+                  apiKey: int16(ord(akAddPartitionsToTxn)), minVersion: 0, maxVersion: 0
+                ),
+              ],
+            )
+          )
+          let req = await fb.nextRequest(timeout = 5.seconds)
+          # A lock-free failure (another send's terminal error) poisons the txn
+          # while the registration is on the wire.
+          p.setTxnState(tsError)
+          await req.respond(
+            buildAddPartitionsToTxnResponseBody(
+              "t", [(0'i32, keProducerFenced.toInt16)]
+            )
+          )
+        except CatchableError:
+          discard
+
+      let handlerFut = handler()
+      await b.connect()
+      var msg = ""
+      try:
+        discard await p.send("t", @[1'u8], partition = 0)
+      except KafkaError as e:
+        msg = e.msg
+      check "PRODUCER_FENCED" in msg
+      check p.txnState == tsFatal
+
+      await p.close()
+      handlerFut.cancelSoon()
+      awaitDrain(handlerFut, 1.seconds)
+      await b.close()
+      await fb.close()
+
+    waitFor body()
+
+  test "a send cancelled before its record joins refuses the commit waiting on it":
+    ## Regression: an immediate send registers a barrier marker the commit waits on,
+    ## but a cancel while it waited for its in-flight permit poisoned only in
+    ## tsInTransaction, so the commit already in tsCommitting went ahead without it.
+    proc body() {.async: (raises: [Exception]).} =
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let p = newKafkaProducer(
+        cluster,
+        transactionalId = some("test-txn"),
+        enableIdempotence = true,
+        maxInFlightRequests = 1,
+        timeoutMs = 200,
+      )
+      # Unreachable, so a commit that wrongly went ahead fails at EndTxn instead.
+      let dummy = newBroker(
+        nodeId = -1,
+        host = "127.0.0.1",
+        port = 1'i32,
+        clientId = "test-client",
+        requestTimeoutMs = 100,
+        connectTimeoutMs = 100,
+      )
+      p.setTxnCoordinator(dummy)
+      let tp = TopicPartition(topic: "t", partition: 0)
+      p.setProducerId(1000'i64, 0'i16)
+      p.setTxnState(tsInTransaction)
+      # Already registered, so the send reaches its permit wait with no RPC.
+      p.addTxnPartition(tp)
+      # Held, so the send parks after registering its marker.
+      check await p.tryAcquireInflightSemaphore(tp)
+      let fut = p.send("t", @[1'u8], partition = 0)
+      let commitFut = p.commitTransaction()
+      let deadline = Moment.now() + 2.seconds
+      while p.txnState != tsCommitting and Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      check p.txnState == tsCommitting
+      await fut.cancelAndWait()
+      check fut.cancelled()
+      check p.txnState == tsError
+      var msg = ""
+      try:
+        await commitFut
+      except KafkaError as e:
+        msg = e.msg
+      check "cannot commit" in msg
+      p.releaseInflightSemaphore(tp)
+      await dummy.close()
+      await p.close()
+      await cluster.close()
+
+    waitFor body()
+
+  test "a batched send failing while the commit runs refuses that commit":
+    ## Regression: only an immediate send poisoned a committing txn (the commit
+    ## waits on its barrier marker), so a batched send failing once the commit had
+    ## begun left it committable without the record.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer(lingerMs = 60_000, maxPendingRecords = 1)
+      let tp = TopicPartition(topic: "t", partition: 0)
+      # Registered but not started, so a commit that wrongly went ahead finalizes
+      # locally instead of needing a coordinator.
+      p.addTxnPartition(tp)
+      p.setTxnStarted(false)
+      # The only pending-record permit, so the send parks before its record joins.
+      check await p.tryAcquirePendingRecord()
+      let fut = p.send("t", @[1'u8], partition = 0)
+      # Parks the commit in tsCommitting, waiting on an in-flight flush.
+      let gate = newFuture[void]("test-gate")
+      let inflight = p.simulateInflightFlushForTest(gate)
+      let commitFut = p.commitTransaction()
+      check p.txnState == tsCommitting
+      p.releasePendingRecordForTest()
+      check await fut.withTimeout(2.seconds)
+      check fut.failed()
+      check p.txnState == tsError
+      gate.complete()
+      await inflight
+      var msg = ""
+      try:
+        await commitFut
+      except KafkaError as e:
+        msg = e.msg
+      check "cannot commit" in msg
+      await p.close()
+
+    waitFor body()
+
+  test "a commit made while a send has yet to join is refused":
+    ## Regression: a commit waited only for buffered and in-flight records, so a
+    ## fire-and-forget send still waiting on backpressure failed after the commit
+    ## had gone through without it, its error reaching only the callback.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer(lingerMs = 60_000, maxPendingRecords = 1)
+      let tp = TopicPartition(topic: "t", partition: 0)
+      p.addTxnPartition(tp)
+      p.setTxnStarted(false)
+      check await p.tryAcquirePendingRecord()
+      var cbErr = ""
+      proc callback(
+          res: ProduceResult, err: ref KafkaError
+      ) {.closure, gcsafe, raises: [].} =
+        if err != nil:
+          cbErr = err.msg
+
+      await p.sendFireAndForget("t", @[1'u8], partition = 0, callback = callback)
+      var msg = ""
+      try:
+        await p.commitTransaction()
+      except KafkaError as e:
+        msg = e.msg
+      check "cannot commit" in msg
+      check p.txnState == tsError
+      p.releasePendingRecordForTest()
+      let deadline = Moment.now() + 2.seconds
+      while cbErr.len == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      check "transaction state changed during send" in cbErr
+      await p.close()
+
+    waitFor body()
+
+  test "a send cancelled before its record joins poisons the transaction":
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      # Held, so the send can only park before its record joins.
+      await p.acquireTxnLock()
+      let fut = p.send("t", @[1'u8])
+      await fut.cancelAndWait()
+      p.releaseTxnLock()
+      check fut.cancelled()
+      check p.txnState == tsError
+      await p.close()
+
+    waitFor body()
+
+  test "a failure after a later transaction began leaves that one alone":
+    proc body() {.async: (raises: [Exception]).} =
+      var p: KafkaProducer
+      proc partitioner(
+          topic: string, key: Option[seq[byte]], partitionCount: int32
+      ): int32 {.closure, gcsafe, raises: [].} =
+        # Meanwhile the txn the send was called in ended and the next one began.
+        p.setTxnState(tsReady)
+        try:
+          p.beginTransaction()
+        except KafkaError:
+          discard
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional partitioner bug")
+
+      p = newJoinTestProducer(partitioner)
+      var raised = false
+      try:
+        discard await p.send("t", @[1'u8])
+      except KafkaError:
+        raised = true
+      check raised
+      check p.txnState == tsInTransaction
+      await p.close()
+
+    waitFor body()
+
+  test "a send whose transaction ended while it awaited does not join the next one":
+    ## Regression: the txnLock re-check looked at the state alone, which the next
+    ## txn restores to tsInTransaction, so the record joined a txn begun after send
+    ## was called.
+    proc body() {.async: (raises: [Exception]).} =
+      var p: KafkaProducer
+      proc partitioner(
+          topic: string, key: Option[seq[byte]], partitionCount: int32
+      ): int32 {.closure, gcsafe, raises: [].} =
+        p.setTxnState(tsReady)
+        try:
+          p.beginTransaction()
+        except KafkaError:
+          discard
+        0
+
+      p = newJoinTestProducer(partitioner)
+      var msg = ""
+      try:
+        discard await p.send("t", @[1'u8])
+      except KafkaError as e:
+        msg = e.msg
+      check msg == "transaction changed during send (a later transaction is open)"
+      check p.txnState == tsInTransaction
+      check p.txnPendingPartitionCount() == 0
+      await p.close()
+
+    waitFor body()
+
+  test "a batched send whose transaction ended while it waited does not join the next one":
+    ## Regression: the enqueue re-check under batchLock looked at the state alone,
+    ## so a batched send that marked its partition in one txn appended its record
+    ## to the next one once that had begun.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer(lingerMs = 60_000)
+      let tp = TopicPartition(topic: "t", partition: 0)
+      # Held, so the send parks after marking its partition, before appending.
+      await p.acquireBatchLock()
+      let fut = p.send("t", @[1'u8], partition = 0)
+      let deadline = Moment.now() + 2.seconds
+      while p.txnPendingPartitionCount() == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      check p.txnPendingPartitionCount() == 1
+      # Meanwhile the txn the send was called in ended and the next one began.
+      p.setTxnState(tsReady)
+      p.beginTransaction()
+      p.releaseBatchLock()
+      # Bounded: a send that wrongly joined would wait out the linger instead.
+      check await fut.withTimeout(2.seconds)
+      check fut.failed()
+      if fut.failed():
+        check fut.error.msg ==
+          "transaction changed during send (a later transaction is open)"
+      check p.txnState == tsInTransaction
+      check p.pendingBatchBytesFor(tp) == 0
+      # Drop any batch before close(), which would flush it, and this producer has no
+      # coordinator to register its partition with.
+      p.failBatchFuturesForTest(tp, newException(KafkaError, "test teardown"))
+      await p.close()
+
+    waitFor body()
+
+  test "cancelling a batched send after its record joined leaves the transaction open":
+    ## The record stays in the batch and goes out with the commit, so poisoning
+    ## the txn here would refuse a commit that is still whole.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer(lingerMs = 60_000)
+      let tp = TopicPartition(topic: "t", partition: 0)
+      let fut = p.send("t", @[1'u8], partition = 0)
+      let deadline = Moment.now() + 2.seconds
+      while p.pendingBatchBytesFor(tp) == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      check p.pendingBatchBytesFor(tp) > 0
+      await fut.cancelAndWait()
+      check fut.cancelled()
+      check p.txnState == tsInTransaction
+      check p.pendingBatchBytesFor(tp) > 0
+      # Drop the batch: close() would flush it, and this producer has no coordinator
+      # to register its partition with.
+      p.failBatchFuturesForTest(tp, newException(KafkaError, "test teardown"))
+      await p.close()
+
+    waitFor body()
+
+suite "Producer: each client guards its own metrics hook":
+  test "producers and their cluster report hook failures separately":
+    ## Regression: one threadvar held the report window for every hook on the
+    ## thread, so while one client's hook kept failing another's failure was only
+    ## counted, never named. Each client constructor now guards the hook it is given.
+    proc body() {.async: (raises: [Exception]).} =
+      let hook: MetricsHook = proc(
+          event: cstring, tags: openArray[(cstring, cstring)], value: int64
+      ) {.gcsafe, raises: [].} =
+        {.cast(raises: []).}:
+          raise newException(ValueError, "intentional hook bug")
+      let cluster = newCluster(@["127.0.0.1:9092"], metricsHook = hook)
+      let first = newKafkaProducer(cluster, metricsHook = hook)
+      let second = newKafkaProducer(cluster, metricsHook = hook)
+
+      let logger = ProducerLogSink()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        for stored in [cluster.metricsHook, first.metricsHook, second.metricsHook]:
+          emitMetric(stored, meProducerSendOk, noTags, 1)
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+      # One report per client: through a shared window only the first would show.
+      check logger.messages.len == 3
+      for msg in logger.messages:
+        check "intentional hook bug" in msg
+
+      await first.close()
+      await second.close()
+      await cluster.close()
+
+    waitFor body()
 
 suite "Producer: duplicate sequence is a deduped success":
   ## `doSendWithRetry` classifies DUPLICATE_SEQUENCE_NUMBER as `raDuplicate` and
@@ -3424,6 +3945,96 @@ suite "Producer: sendOffsetsToTransaction poisons txn on failure":
       await dummy.close()
       await p.close()
       await cluster.close()
+
+    waitFor body()
+
+  test "sendOffsetsToTransaction does not run in a transaction begun while it awaited":
+    ## Regression: the txnLock re-check looked at the state alone, which the next
+    ## txn restores to tsInTransaction, so offsets meant for one txn went into the
+    ## next, and their failure poisoned it. Here the window is a deferred epoch bump:
+    ## an abort from tsError does not wait for it.
+    proc body() {.async: (raises: [Exception]).} =
+      let cluster = newCluster(@["127.0.0.1:1"])
+      let p = newKafkaProducer(
+        cluster,
+        transactionalId = some("test-txn"),
+        enableIdempotence = true,
+        timeoutMs = 200,
+      )
+      # Unreachable, so offsets that wrongly ran would fail and poison the next txn.
+      let dummy = newBroker(
+        nodeId = -1,
+        host = "127.0.0.1",
+        port = 1'i32,
+        clientId = "test-client",
+        requestTimeoutMs = 100,
+        connectTimeoutMs = 100,
+      )
+      p.setTxnCoordinator(dummy)
+      seedTxnProducer(p)
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "txn-topic", partition: 0'i32)] = 10'i64
+
+      p.holdEpochBumpGate()
+      let fut = p.sendOffsetsToTransaction(offsets, "test-group")
+      check not fut.finished
+      # Meanwhile the txn the call was made in ended and the next one began.
+      p.setTxnState(tsReady)
+      p.beginTransaction()
+      p.releaseEpochBumpGate()
+      var msg = ""
+      try:
+        await fut
+      except KafkaError as e:
+        msg = e.msg
+      check msg ==
+        "transaction changed during sendOffsetsToTransaction (a later transaction is open)"
+      check p.txnState == tsInTransaction
+      await dummy.close()
+      await p.close()
+      await cluster.close()
+
+    waitFor body()
+
+  test "sendOffsetsToTransaction made before beginTransaction is refused as such":
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      p.setTxnState(tsReady)
+      p.holdEpochBumpGate()
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "t", partition: 0'i32)] = 10'i64
+      let fut = p.sendOffsetsToTransaction(offsets, "test-group")
+      p.beginTransaction()
+      p.releaseEpochBumpGate()
+      var msg = ""
+      try:
+        await fut
+      except KafkaError as e:
+        msg = e.msg
+      check msg == "must be in transaction to send offsets"
+      check p.txnState == tsInTransaction
+      await p.close()
+
+    waitFor body()
+
+  test "sendOffsetsToTransaction cancelled before taking txnLock poisons the transaction":
+    ## Regression: only a failure under txnLock poisoned the txn, so a cancel while
+    ## waiting for the lock (or a deferred epoch bump) left it committable without
+    ## the offsets.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "t", partition: 0'i32)] = 10'i64
+      await p.acquireTxnLock()
+      let fut = p.sendOffsetsToTransaction(offsets, "test-group")
+      check not fut.finished
+      await fut.cancelAndWait()
+      check fut.cancelled()
+      check p.txnState == tsError
+      # The lock it never took is still the test's.
+      check p.isTxnLocked()
+      p.releaseTxnLock()
+      await p.close()
 
     waitFor body()
 

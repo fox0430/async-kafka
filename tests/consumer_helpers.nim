@@ -41,6 +41,20 @@ proc markClosed*(c: KafkaConsumer) =
   privateAccess(KafkaConsumer)
   c.state = lsClosed
 
+proc metricsHooksForTest*(c: KafkaConsumer): array[2, MetricsHook] =
+  ## Test helper. The metrics hooks the consumer and its Cluster hold, each guarded
+  ## from the one it was given.
+  privateAccess(KafkaConsumer)
+  privateAccess(Cluster)
+  [c.config.metricsHook, c.cluster.metricsHook]
+
+proc reportCommitResultForTest*(
+    c: KafkaConsumer, cb: CommitCallback, err: ref KafkaError
+) =
+  ## Test helper. Drive commitAsync's outcome reporting with a chosen commit error,
+  ## which a real commit only hands over when a broker rejects it.
+  c.reportCommitResult(cb, err)
+
 proc requestRebalance*(c: KafkaConsumer) =
   ## Test helper. Set the rebalance-requested flag on the consumer group.
   privateAccess(KafkaConsumer)
