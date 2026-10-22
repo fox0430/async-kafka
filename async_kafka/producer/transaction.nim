@@ -232,6 +232,9 @@ proc beginTransaction*(p: KafkaProducer) {.raises: [KafkaError].} =
     warnTransitionFailed(p, tsInTransaction, "beginTransaction")
   else:
     emitMetric(p.metricsHook, meProducerTxnBegin, noTags, 1)
+  inc p.txnSeq
+  # Sends still counted belong to the txn that just ended and never decrement this one.
+  p.txnUnjoinedSends = 0
   p.finalizeTxnTracking(owesEpochBump = false)
   # Client-only change: the coordinator has no txn yet, so a commit/abort before the
   # first send must skip EndTxn; finalizeTxnTracking clears the broker-side marker.
@@ -537,15 +540,28 @@ proc sendOffsetsToTransaction*(
   ## stale consumer generation (KIP-447); `initUnfencedConsumerGroupMetadata` is the
   ## deliberate pre-447 form. Re-validated here, before any wire bytes, so a half-set
   ## or later-mutated pair is refused instead of silently unfenced.
-  # Resolve a deferred epoch bump before txnLock (the single-flight gate must not
-  # run inside it) so AddOffsetsToTxn / TxnOffsetCommit carry the current epoch.
+  # A commit and a synchronous beginTransaction can open the next txn while this
+  # awaits, and the state alone reads tsInTransaction again.
+  let txnSeq = p.txnSeq
   validateConsumerGroupMetadata(groupMetadata)
-  await p.ensureEpochBumped()
-  await p.txnLock.acquire()
+  # Before the awaits too, so a call outside a txn fails as such, not as a replaced txn.
+  if p.txnState != tsInTransaction:
+    raise newException(KafkaError, "must be in transaction to send offsets")
 
+  var locked = false
   try:
+    # Resolve a deferred epoch bump before txnLock (the single-flight gate must not
+    # run inside it) so AddOffsetsToTxn / TxnOffsetCommit carry the current epoch.
+    await p.ensureEpochBumped()
+    await p.txnLock.acquire()
+    locked = true
     if p.txnState != tsInTransaction:
       raise newException(KafkaError, "must be in transaction to send offsets")
+    if p.txnSeq != txnSeq:
+      raise newException(
+        KafkaError,
+        "transaction changed during sendOffsetsToTransaction (a later transaction is open)",
+      )
 
     let addReq = AddOffsetsToTxnRequest(
       transactionalId: p.transactionalId.get,
@@ -619,9 +635,9 @@ proc sendOffsetsToTransaction*(
     # Poison before re-raising so a later commitTransaction is refused by the
     # post-flush tsError/tsFatal guard, instead of committing offsets that never
     # reached the coordinator (EOS violation). An API error picks tsFatal vs tsError
-    # by class; a transport error is abortable. The tsInTransaction guard keeps a
-    # wrong-state rejection from poisoning an unrelated committing/aborting txn.
-    if p.txnState == tsInTransaction:
+    # by class; a transport error is abortable. The guard keeps a wrong-state
+    # rejection from poisoning an unrelated committing/aborting txn, or a later one.
+    if p.txnSeq == txnSeq and p.txnState == tsInTransaction:
       if offsetsErr of KafkaApiError:
         p.transitionToError((ref KafkaApiError)(offsetsErr).errorCode)
       else:
@@ -637,10 +653,9 @@ proc sendOffsetsToTransaction*(
         )
     raise
   except CancelledError:
-    # A cancel after AddOffsetsToTxn moved the txn to Ongoing (txnStarted=true) but
-    # before the offsets committed would let a later commit EndTxn(commit) a txn
-    # missing them; abortable.
-    if p.txnState == tsInTransaction:
+    # A cancel before the offsets committed, while waiting for the bump or txnLock
+    # included, would let a later commit EndTxn(commit) a txn missing them; abortable.
+    if p.txnSeq == txnSeq and p.txnState == tsInTransaction:
       if not p.tryTransition(tsError):
         warnTransitionFailed(p, tsError, "sendOffsetsToTransaction cancellation")
       emitMetric(
@@ -651,7 +666,8 @@ proc sendOffsetsToTransaction*(
       )
     raise
   finally:
-    p.txnLock.releaseSafely("producer.sendOffsetsToTransaction")
+    if locked:
+      p.txnLock.releaseSafely("producer.sendOffsetsToTransaction")
 
 proc sendOffsetsToTransaction*(
     p: KafkaProducer, offsets: Table[TopicPartition, int64], groupId: string

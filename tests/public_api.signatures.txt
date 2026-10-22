@@ -30,6 +30,7 @@ KafkaOffsetFetchError skType object of KafkaApiError|partitionErrors:seq[Partiti
 KafkaProducer skType ref object
 KafkaProtocolError skType object of KafkaError
 KafkaRebalanceCallbackError skType object of KafkaError
+KafkaRecordRejectedError skType object of KafkaError
 KafkaTimeoutError skType object of KafkaError
 LifecycleState skType enum|lsUninitialized=0|lsRunning=1|lsClosing=2|lsClosed=3
 MetricsHook skType MetricsHook* = proc (event: cstring; tags: openArray[(cstring, cstring)]; value: int64) {.closure, gcsafe, raises: [].}

@@ -1,4 +1,4 @@
-import std/[unittest, os, strutils]
+import std/[unittest, os, strutils, options, monotimes, importutils]
 import std/logging as stdLogging
 
 import chronos
@@ -6,7 +6,9 @@ import chronos
 import async_kafka/errors
 import async_kafka/async_backend
 import
-  async_kafka/internal/[backoff, cancel, metrics, coordinator_rpc, retry, safe_logging]
+  async_kafka/internal/
+    [backoff, callback_guard, cancel, coordinator_rpc, retry, safe_logging]
+import async_kafka/internal/metrics {.all.}
 
 const projectRoot = currentSourcePath.parentDir.parentDir
 
@@ -18,6 +20,37 @@ method log(
 ) {.gcsafe.} =
   inc logger.calls
   raise newException(IOError, "intentional logger failure")
+
+type RecordingLogger = ref object of stdLogging.Logger
+  messages: seq[string]
+
+method log(
+    logger: RecordingLogger, level: stdLogging.Level, args: varargs[string, `$`]
+) {.gcsafe.} =
+  ## Captures what a handler would print, so a test can assert that a diagnostic
+  ## actually reaches the application's handler with the identifier in it.
+  logger.messages.add(args.join(""))
+
+proc buggyCallback(fails: bool) {.gcsafe, raises: [].} =
+  ## Stands in for a user callback that raises despite its `raises: []` type.
+  if fails:
+    {.cast(raises: []).}:
+      raise newException(ValueError, "boom")
+
+type ReentrantLogger = ref object of stdLogging.Logger
+  failures: ref CallbackFailureLog
+  messages: seq[string]
+
+method log(
+    logger: ReentrantLogger, level: stdLogging.Level, args: varargs[string, `$`]
+) {.gcsafe.} =
+  ## A handler that runs the failing callback again, as one emitting a metric per
+  ## log line would.
+  logger.messages.add(args.join(""))
+  discard logger.failures[].guardCallback("cb", ""):
+    buggyCallback(fails = true)
+
+privateAccess(CallbackFailureLog)
 
 suite "safe logging":
   test "catchable handler failures do not escape diagnostic boundaries":
@@ -130,6 +163,171 @@ suite "MetricsHook":
       check cap.events[1][1].len == 2
 
     runTest()
+
+  test "a hook that leaks an exception is contained and logged":
+    ## Regression: emitMetric invoked the hook without a CatchableError guard
+    ## (asymmetric with invokeErrorHandler). A hook leaking an exception through
+    ## `{.cast(raises: []).}` unwound through the chronos dispatcher, abandoning
+    ## the coroutine that fired the event — the connection readLoop among them.
+    type Capture = ref object
+      calls: int
+
+    proc runTest() =
+      let cap = Capture()
+      let hook = guardMetricsHook(
+        proc(
+            event: cstring, tags: openArray[(cstring, cstring)], value: int64
+        ) {.gcsafe, raises: [].} =
+          inc cap.calls
+          {.cast(raises: []).}:
+            raise newException(ValueError, "intentional hook bug")
+      )
+
+      let logger = RecordingLogger()
+      let previousLogFilter = stdLogging.getLogFilter()
+      stdLogging.setLogFilter(stdLogging.lvlAll)
+      stdLogging.addHandler(logger)
+      try:
+        # One emit per overload: cstring tags, then string tags.
+        emitMetric(hook, meProducerSendOk, noTags, 1)
+        emitMetric(hook, meProducerSendError, [("topic", "orders")], 1)
+      finally:
+        stdLogging.removeHandler(logger)
+        stdLogging.setLogFilter(previousLogFilter)
+
+      # Every emit reaches the hook, but failures within one interval are logged
+      # once: the hook fires per event on hot paths, so one line per event would
+      # flood the log.
+      check cap.calls == 2
+      check logger.messages ==
+        @[
+          "metricsHook raised ValueError: intentional hook bug (dropped producer.send.ok)"
+        ]
+
+    runTest()
+
+  test "each guarded hook reports its own failures":
+    ## Regression: one threadvar held the report window for every hook on the
+    ## thread, so a second client's failing hook only added to the first one's
+    ## count and was never named while the first kept failing.
+    proc failingHook(bug: string): MetricsHook =
+      result = proc(
+          event: cstring, tags: openArray[(cstring, cstring)], value: int64
+      ) {.gcsafe, raises: [].} =
+        {.cast(raises: []).}:
+          raise newException(ValueError, bug)
+
+    let first = guardMetricsHook(failingHook("first hook bug"))
+    let second = guardMetricsHook(failingHook("second hook bug"))
+    let logger = RecordingLogger()
+    let previousLogFilter = stdLogging.getLogFilter()
+    stdLogging.setLogFilter(stdLogging.lvlAll)
+    stdLogging.addHandler(logger)
+    try:
+      emitMetric(first, meProducerSendOk, noTags, 1)
+      emitMetric(second, meProducerSendOk, noTags, 1)
+    finally:
+      stdLogging.removeHandler(logger)
+      stdLogging.setLogFilter(previousLogFilter)
+    check logger.messages.len == 2
+    check "first hook bug" in logger.messages[0]
+    check "second hook bug" in logger.messages[1]
+
+  test "a hook that skipped guardMetricsHook is still contained":
+    ## A hook set directly on a lower-level component never passed through a
+    ## client constructor; emitMetric's backstop must contain it all the same.
+    let hook: MetricsHook = proc(
+        event: cstring, tags: openArray[(cstring, cstring)], value: int64
+    ) {.gcsafe, raises: [].} =
+      {.cast(raises: []).}:
+        raise newException(ValueError, "unguarded hook bug")
+
+    let logger = RecordingLogger()
+    let previousLogFilter = stdLogging.getLogFilter()
+    stdLogging.setLogFilter(stdLogging.lvlAll)
+    stdLogging.addHandler(logger)
+    unguardedHookFailures = CallbackFailureLog()
+    try:
+      emitMetric(hook, meProducerSendOk, noTags, 1)
+    finally:
+      stdLogging.removeHandler(logger)
+      stdLogging.setLogFilter(previousLogFilter)
+    check logger.messages ==
+      @["metricsHook raised ValueError: unguarded hook bug (dropped producer.send.ok)"]
+
+suite "callback failure reports":
+  test "failures dropped before a callback recovers are still reported":
+    ## Regression: the dropped count rode only on the next failure's report, so a
+    ## callback that stopped failing took it with it.
+    var failures: CallbackFailureLog
+    let logger = RecordingLogger()
+    let previousLogFilter = stdLogging.getLogFilter()
+    stdLogging.setLogFilter(stdLogging.lvlAll)
+    stdLogging.addHandler(logger)
+    var raised: seq[ref CatchableError]
+    try:
+      for _ in 0 ..< 3:
+        let r = failures.guardCallback("cb", "fell back"):
+          buggyCallback(fails = true)
+        raised.add r
+      # Still inside the report window: nothing to say yet.
+      let r = failures.guardCallback("cb", "fell back"):
+        buggyCallback(fails = false)
+      raised.add r
+      failures.lastReport = some(getMonoTime() - callbackFailureReportInterval)
+      for _ in 0 ..< 2:
+        let r = failures.guardCallback("cb", "fell back"):
+          buggyCallback(fails = false)
+        raised.add r
+    finally:
+      stdLogging.removeHandler(logger)
+      stdLogging.setLogFilter(previousLogFilter)
+    check logger.messages ==
+      @[
+        "cb raised ValueError: boom (fell back)",
+        "cb raised 2 more times since the last report",
+      ]
+    for i, e in raised:
+      check (e != nil) == (i < 3)
+
+  test "a failure after the window carries the count dropped within it":
+    var failures: CallbackFailureLog
+    let logger = RecordingLogger()
+    let previousLogFilter = stdLogging.getLogFilter()
+    stdLogging.setLogFilter(stdLogging.lvlAll)
+    stdLogging.addHandler(logger)
+    try:
+      for _ in 0 ..< 3:
+        discard failures.guardCallback("cb", ""):
+          buggyCallback(fails = true)
+      failures.lastReport = some(getMonoTime() - callbackFailureReportInterval)
+      discard failures.guardCallback("cb", ""):
+        buggyCallback(fails = true)
+    finally:
+      stdLogging.removeHandler(logger)
+      stdLogging.setLogFilter(previousLogFilter)
+    check logger.messages ==
+      @[
+        "cb raised ValueError: boom",
+        "cb raised ValueError: boom (2 more failures since the last report)",
+      ]
+
+  test "a log handler that re-enters a failing callback does not recurse":
+    ## Regression: the report window was stamped after logging, so a handler that
+    ## ran the callback again found it open and reported, recursing without end.
+    let failures = new CallbackFailureLog
+    let logger = ReentrantLogger(failures: failures)
+    let previousLogFilter = stdLogging.getLogFilter()
+    stdLogging.setLogFilter(stdLogging.lvlAll)
+    stdLogging.addHandler(logger)
+    try:
+      discard failures[].guardCallback("cb", ""):
+        buggyCallback(fails = true)
+    finally:
+      stdLogging.removeHandler(logger)
+      stdLogging.setLogFilter(previousLogFilter)
+    check logger.messages == @["cb raised ValueError: boom"]
+    check failures.suppressed == 1
 
 type
   FakeCoordResp = object
@@ -432,16 +630,6 @@ suite "runCoordinatorRpc":
       check h.rediscoverCount == 0
 
     waitFor body()
-
-type RecordingLogger = ref object of stdLogging.Logger
-  messages: seq[string]
-
-method log(
-    logger: RecordingLogger, level: stdLogging.Level, args: varargs[string, `$`]
-) {.gcsafe.} =
-  ## Captures what a handler would print, so a test can assert that a diagnostic
-  ## actually reaches the application's handler with the identifier in it.
-  logger.messages.add(args.join(""))
 
 suite "absorbDuringTeardown":
   test "an absorbed failure reaches the handler with its site and reason":

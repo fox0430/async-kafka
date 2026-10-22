@@ -54,7 +54,18 @@ proc resolvePartition*(
   # affinity.
 
   if p.customPartitioner != nil:
-    let partitionId = p.customPartitioner(topic, key, partCount)
+    # A raise despite `raises: []` would escape send's raises list, so it fails this
+    # send instead. Always wrapped, so a partitioner bug cannot pass for a broker error
+    # or a cancellation.
+    let partitionId =
+      try:
+        p.customPartitioner(topic, key, partCount)
+      except CatchableError as e:
+        raise newException(
+          KafkaError,
+          "custom partitioner raised " & $e.name & " for topic " & topic & ": " & e.msg,
+          e,
+        )
     if partitionId < 0 or partitionId >= partCount:
       raise newException(
         KafkaError,

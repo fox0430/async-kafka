@@ -6,7 +6,7 @@ from std/times import epochTime
 
 import ../[async_backend, errors, broker, cluster, group_metadata]
 import ../protocol/[messages, compression]
-import ../internal/metrics
+import ../internal/[callback_guard, metrics]
 
 export metrics.MetricsHook
 export group_metadata
@@ -38,7 +38,9 @@ type
   CustomPartitioner* = proc(
     topic: string, key: Option[seq[byte]], partitionCount: int32
   ): int32 {.closure, gcsafe, raises: [].}
-    ## Runs on the send path: must be pure and cheap.
+    ## Runs on the send path: must be pure, cheap, and non-raising. An out-of-range
+    ## result fails the send, as does a `CatchableError` raised anyway (wrapped in a
+    ## `KafkaError` as its `parent`); a `Defect` is not caught.
 
   PendingMessage* = object
     record*: Record
@@ -158,6 +160,12 @@ type
       ## Validated at construction; `none` means a plain or idempotent producer.
     transactionTimeoutMs: int32
     txnState: TransactionState
+    txnSeq: int64
+      ## Bumped by every `beginTransaction`, so an awaiting call can tell its txn from
+      ## a later one (the state alone cannot).
+    txnUnjoinedSends: int
+      ## `send` calls of the current txn whose record has yet to join it. A commit
+      ## refuses while any remain: once it has begun they can no longer join.
     txnLock: AsyncLock
     txnCoordinator: Broker
     txnPartitions: HashSet[TopicPartition]
@@ -181,6 +189,10 @@ type
     epochBumpDone: Future[void]
       ## Completes when the single-flight bump settles; nil while none is in flight.
     errorHandler: ErrorHandler
+    errorHandlerFailures: CallbackFailureLog
+      ## Reports an `errorHandler` that raises despite its `raises: []` type.
+    produceCallbackFailures: CallbackFailureLog
+      ## Same for a `sendFireAndForget` callback.
     dlqTopic: string
     dlqProducer: KafkaProducer
     ownsDlqProducer: bool
@@ -223,7 +235,8 @@ type
   ProduceCallback* =
     proc(result: ProduceResult, error: ref KafkaError) {.closure, gcsafe, raises: [].}
     ## Exactly one of `result` / `error` signals the outcome. Runs on the
-    ## completion path: keep it short and non-raising.
+    ## completion path: keep it short and non-raising (a `CatchableError` raised
+    ## anyway is logged along with `error`; a `Defect` is not caught).
 
   ErrorAction* = enum
     ## Failed-record routing.
@@ -243,9 +256,9 @@ type
 
   ErrorHandler* =
     proc(record: FailedRecord): ErrorAction {.closure, gcsafe, raises: [].}
-    ## Must not raise (a raise falls back to `eaFail`); transactional sends bypass it
-    ## entirely, so the failure surfaces to `send` and the transaction cannot commit
-    ## without the record.
+    ## Must not raise (a raise is logged and falls back to `eaFail`, as with no
+    ## handler); transactional sends bypass it entirely, so the failure surfaces to
+    ## `send` and the transaction cannot commit without the record.
 
 proc toBytes*(s: string): seq[byte] =
   ## `s` as a `seq[byte]` copy, for the record value/key arguments. Mutating the

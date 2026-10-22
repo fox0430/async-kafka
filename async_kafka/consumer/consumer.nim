@@ -2,7 +2,7 @@ import std/[tables, options, importutils]
 
 import ../[async_backend, errors, cluster, broker, connection, sasl, group_metadata]
 import ../protocol/messages
-import ../internal/[backoff, cancel, metrics, retry, safe_logging]
+import ../internal/[backoff, callback_guard, cancel, metrics, retry, safe_logging]
 import assignment, group, fetcher
 
 privateAccess(FetchedRecord)
@@ -214,6 +214,8 @@ type
       ## fired for this episode, cleared on a successful rejoin — without it, a
       ## retry-exhaustion raise would re-fire the revoked/lost callback for the same
       ## assignment.
+    commitCallbackFailures: CallbackFailureLog
+      ## Reports a `commitAsync` callback that raises despite its `raises: []` type.
 
   OffsetFetchAction* = enum
     ofaUseOffset ## errorCode == keNone and offset >= 0 — committed offset present
@@ -227,7 +229,8 @@ type
 
   CommitCallback* = proc(err: ref KafkaError) {.gcsafe, raises: [].}
     ## Async-commit completion: `nil` on success, the failure otherwise. Runs on
-    ## the commit path, so it must be cheap and never raise.
+    ## the commit path, so it must be cheap and never raise (a `CatchableError`
+    ## raised anyway is logged along with the commit error; a `Defect` is not caught).
 
 type ConsumerConfigDefaults = object
   sessionTimeoutMs: int32
@@ -343,7 +346,10 @@ proc newKafkaConsumerOnCluster(
 ): KafkaConsumer {.raises: [KafkaError].} =
   ## Shared body of both public overloads. The Cluster's transport settings are
   ## already fixed by the time it runs, so `config`'s transport fields are not read.
-  let config = withDefaults(config)
+  var config = withDefaults(config)
+  # Guarded here rather than in `newKafkaConsumer(config)`, which hands the raw hook
+  # to the Cluster it builds: each client guards its own copy.
+  config.metricsHook = guardMetricsHook(config.metricsHook)
   let group = newConsumerGroup(
     cluster,
     config.groupId,
@@ -1638,6 +1644,45 @@ proc pausedPartitions*(c: KafkaConsumer): seq[TopicPartition] {.raises: [].} =
   ## Partitions currently suspended by `pause`.
   c.fetcher.pausedPartitions()
 
+proc isNonRetriableCommitError(err: ref KafkaError): bool {.raises: [].} =
+  ## A broker rejection that retrying will not fix. A KafkaCommitError counts when any
+  ## partition failed that way, not only the first one its `errorCode` carries.
+  proc nonRetriable(code: KafkaErrorCode): bool =
+    not (code.isRetriable or code.isRebalanceRequired)
+
+  if err == nil or not (err of KafkaApiError):
+    return false
+  if nonRetriable((ref KafkaApiError)(err).errorCode):
+    return true
+  if err of KafkaCommitError:
+    for pe in (ref KafkaCommitError)(err).partitionErrors:
+      if nonRetriable(pe.errorCode):
+        return true
+  false
+
+proc logCommitError(err: ref KafkaError, why: string) {.raises: [].} =
+  ## Log a commitAsync failure that no callback took, at `error` when non-retriable
+  ## so error-level alerting catches a commit that keeps failing.
+  if isNonRetriableCommitError(err):
+    error "commitAsync non-retriable error (" & why & "): ", err.msg
+  else:
+    warn "commitAsync error (" & why & "): ", err.msg
+
+proc reportCommitResult(
+    c: KafkaConsumer, cb: CommitCallback, err: ref KafkaError
+) {.raises: [].} =
+  ## Hand a commitAsync outcome (`nil` on success) to the callback, or log a failure
+  ## when there is none or it raises. The guard keeps such a raise out of
+  ## commitAsync's caller and the chronos dispatcher.
+  if cb == nil:
+    if err != nil:
+      logCommitError(err, "no callback")
+    return
+  let raised = c.commitCallbackFailures.guardCallback("commitAsync callback", ""):
+    cb(err)
+  if raised != nil and err != nil:
+    logCommitError(err, "callback raised")
+
 proc commitAsync*(c: KafkaConsumer, callback: CommitCallback = nil) {.raises: [].} =
   ## Fire-and-forget offset commit. Optional callback for error notification.
   ## Never raises: on a closed consumer the error goes to the callback, as it does
@@ -1647,11 +1692,7 @@ proc commitAsync*(c: KafkaConsumer, callback: CommitCallback = nil) {.raises: []
     # Closing/closed: honour the fire-and-forget contract and route the error through
     # the callback instead of raising synchronously (a raise would bypass the callback
     # the caller registered, on a call it never awaits). No task is spawned.
-    let err = newException(KafkaClosedError, "consumer is closed")
-    if callback != nil:
-      callback(err)
-    else:
-      warn "commitAsync on closed consumer (no callback): ", err.msg
+    c.reportCommitResult(callback, newException(KafkaClosedError, "consumer is closed"))
     return
   # Snapshot the position AND offset VALUES on the caller's coroutine before spawning,
   # so the commit reflects exactly the records handed out by this call, not whatever a
@@ -1669,31 +1710,16 @@ proc commitAsync*(c: KafkaConsumer, callback: CommitCallback = nil) {.raises: []
       await c.commitOffsets(
         some(snapshotOffsets), snapshotGeneration, snapshotLeaderEpochs
       )
-      if callback != nil:
-        callback(nil)
+      c.reportCommitResult(callback, nil)
     except KafkaCommitError as ce:
       # Mirror autoCommitLoop: ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID means the broker
       # rejected our membership and the next poll must rebalance.
       c.armRebalanceFromCommitError(ce)
-      if callback != nil:
-        callback(ce)
-      else:
-        warn "commitAsync error (no callback): ", ce.msg
+      c.reportCommitResult(callback, ce)
     except KafkaError as e:
-      if callback != nil:
-        callback(e)
-      else:
-        var nonRetriable = false
-        if e of KafkaApiError:
-          let cls = (ref KafkaApiError)(e).errorCode.errorClass
-          nonRetriable = cls notin {ecRetriable, ecRebalanceRequired}
-        if nonRetriable:
-          error "commitAsync non-retriable error (no callback): ", e.msg
-        else:
-          warn "commitAsync error (no callback): ", e.msg
+      c.reportCommitResult(callback, e)
     except CancelledError:
-      if callback != nil:
-        callback(newException(KafkaError, "commit cancelled"))
+      c.reportCommitResult(callback, newException(KafkaError, "commit cancelled"))
 
   let fut = task()
   var i = 0

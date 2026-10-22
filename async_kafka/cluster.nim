@@ -238,7 +238,7 @@ proc newCluster*(
     connectTimeoutMs: connectTimeoutMs,
     requestTimeoutMs: requestTimeoutMs,
     metadataRefreshTimeoutMs: metadataRefreshTimeoutMs,
-    metricsHook: metricsHook,
+    metricsHook: guardMetricsHook(metricsHook),
     allowAutoTopicCreation: allowAutoTopicCreation,
   )
 

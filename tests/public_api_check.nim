@@ -8,8 +8,8 @@ import ast, options, pathutils, idents, renderer
 import modulegraphs, passes, commands, cmdlinehelper, types, sem, semdata
 
 const
-  expectedQualifiedApiSize = 205
-  expectedSemanticApiSize = 210
+  expectedQualifiedApiSize = 206
+  expectedSemanticApiSize = 211
   qualifiedManifestPath = "tests/public_api.txt"
   semanticManifestPath = "tests/public_api.signatures.txt"
   # Root of the Nim installation whose compiler sources are linked in; mirrors

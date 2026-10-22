@@ -38,6 +38,14 @@ type
     ## Raised on API calls to a closing/closed Producer/Consumer. Distinct from
     ## KafkaConnectionError so callers can tell "user closed me" from "network died".
 
+  KafkaRecordRejectedError* = object of KafkaError
+    ## A producer `send` refused the record client-side, before it touched a broker
+    ## or the open transaction: it exceeds `maxBatchBytes`. Not retriable; unlike
+    ## other send failures it leaves an open transaction committable, so a caller may
+    ## skip the record (or dead-letter it in the same transaction) and still commit.
+    ## A partition out of range of cached metadata stays a plain `KafkaError`, since
+    ## the topic may have grown; broker-side limit failures poison the transaction.
+
   PartitionCommitError* = object
     ## Reused by KafkaCommitError and KafkaOffsetFetchError; "Commit" predates the reuse.
     topic*: string
