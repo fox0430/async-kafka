@@ -17,6 +17,9 @@ privateAccess(KafkaProducer)
 const
   txnCoordMaxAttempts = 5
   txnCoordBackoffBaseMs = 100'i32
+  txnInProgressStates* = {tsInTransaction, tsCommitting, tsAborting, tsError}
+    ## Begun and not yet finalized: the txn `currentTxnScope` returns, and the one
+    ## `abortTransaction` / `close` may abort.
 
 proc canTransition*(src, dst: TransactionState): bool =
   ## True when the state machine permits the src → dst edge.
@@ -148,6 +151,11 @@ template withTxnCoordinatorRetry*(p: KafkaProducer, call: untyped): untyped =
     rpcCall = call,
   )
 
+proc requireNotFatal*(p: KafkaProducer) {.raises: [KafkaError].} =
+  ## tsFatal is terminal: every txn call refuses until `close` tears the producer down.
+  if p.txnState == tsFatal:
+    raise newException(KafkaError, "producer is in a fatal state and must be closed")
+
 proc initTransactions*(
     p: KafkaProducer
 ) {.async: (raises: [KafkaError, CancelledError]).} =
@@ -158,8 +166,7 @@ proc initTransactions*(
   # Reject a fatal producer before InitProducerId: tsFatal is terminal, so the
   # trailing tryTransition(tsReady) would fail — but only after the RPC allocated a
   # fresh PID (zombie transactional.id) while reporting init success.
-  if p.txnState == tsFatal:
-    raise newException(KafkaError, "producer is in a fatal state and must be closed")
+  p.requireNotFatal()
   # A second initTransactions would allocate a new PID under the same
   # transactional.id, then silently drop the tsReady transition below (illegal edge),
   # orphaning the coordinator's ongoing txn.
@@ -171,8 +178,7 @@ proc initTransactions*(
   try:
     # Recheck under the lock — a concurrent init or a fatal transition may have
     # landed while we were queued.
-    if p.txnState == tsFatal:
-      raise newException(KafkaError, "producer is in a fatal state and must be closed")
+    p.requireNotFatal()
     if p.txnState != tsUninitialized:
       raise newException(
         KafkaError, "initTransactions already called; state=" & $p.txnState
@@ -219,8 +225,7 @@ proc beginTransaction*(p: KafkaProducer) {.raises: [KafkaError].} =
   # Safe without acquire: no await points, so nothing can interleave here.
   if p.txnLock.locked:
     raise newException(KafkaError, "another transaction operation is in progress")
-  if p.txnState == tsFatal:
-    raise newException(KafkaError, "producer is in a fatal state and must be closed")
+  p.requireNotFatal()
   # Only tsReady may begin: canTransition's src == dst self-loop would accept
   # tsInTransaction → tsInTransaction, and the resets below would then wipe a live
   # txn's tracking — a later commit/abort/close would skip EndTxn.
@@ -232,12 +237,108 @@ proc beginTransaction*(p: KafkaProducer) {.raises: [KafkaError].} =
     warnTransitionFailed(p, tsInTransaction, "beginTransaction")
   else:
     emitMetric(p.metricsHook, meProducerTxnBegin, noTags, 1)
-  inc p.txnSeq
-  # Sends still counted belong to the txn that just ended and never decrement this one.
-  p.txnUnjoinedSends = 0
+  # Calls still counted hold the scope of the txn that just ended, never this one.
+  p.txnScope = TxnScope()
   p.finalizeTxnTracking(owesEpochBump = false)
   # Client-only change: the coordinator has no txn yet, so a commit/abort before the
   # first send must skip EndTxn; finalizeTxnTracking clears the broker-side marker.
+
+proc currentTxnScope*(p: KafkaProducer): TxnScope {.raises: [].} =
+  ## The txn a call made now belongs to, closed or poisoned included; nil when none
+  ## is in progress.
+  if p.txnState in txnInProgressStates: p.txnScope else: nil
+
+proc txnChange*(
+    p: KafkaProducer, scope: TxnScope, callName: string
+): Option[string] {.raises: [].} =
+  ## Why the txn a counted call was made in (`scope`) can no longer take its record
+  ## or offsets, or `none` while it still can. A closed scope still can: the call was
+  ## counted before the commit or abort was called, and may join until that one moves
+  ## the state.
+  if p.txnState != tsInTransaction:
+    some("transaction state changed during " & callName & " (now " & $p.txnState & ")")
+  elif p.txnScope != scope:
+    some("transaction changed during " & callName & " (a later transaction is open)")
+  else:
+    none(string)
+
+proc requireTxnUnchanged*(
+    p: KafkaProducer, scope: TxnScope, callName: string
+) {.raises: [KafkaError].} =
+  ## `txnChange` as a refusal, for a call with nothing to release before raising.
+  let changed = p.txnChange(scope, callName)
+  if changed.isSome:
+    raise newException(KafkaError, changed.get)
+
+proc requireSameTxn*(
+    p: KafkaProducer, scope: TxnScope, verb: string
+) {.raises: [KafkaError].} =
+  ## Refuse a call whose txn (`scope`) ended while it waited, so it cannot act on
+  ## the one begun since.
+  if p.txnScope != scope:
+    raise newException(
+      KafkaError,
+      "cannot " & verb &
+        ": its transaction ended while it waited (a later transaction is open)",
+    )
+
+proc requireTxnScope*(
+    p: KafkaProducer, scope: TxnScope, outsideMsg, verb: string
+) {.raises: [KafkaError].} =
+  ## Refuse a `send` / `sendOffsetsToTransaction` made outside a txn (`scope` nil),
+  ## in one replaced since it was captured, after a commit/abort was called on it
+  ## (uncounted, so that call goes ahead without it), in a poisoned one, or by a
+  ## fatal producer.
+  # First, so a fatal producer is never told to begin a txn it would refuse.
+  p.requireNotFatal()
+  if scope.isNil:
+    raise newException(KafkaError, outsideMsg)
+  p.requireSameTxn(scope, verb)
+  # Before the state check, so the refusal reads the same whether or not the
+  # commit/abort has moved the state yet.
+  if scope.ending != teOpen:
+    raise newException(
+      KafkaError,
+      "cannot " & verb & ": commitTransaction or abortTransaction was already called",
+    )
+  if p.txnState == tsError:
+    raise newException(
+      KafkaError,
+      "cannot " & verb & ": the transaction failed and must be aborted (state: tsError)",
+    )
+  if p.txnState != tsInTransaction:
+    raise newException(KafkaError, outsideMsg)
+
+proc poisonTxnOnFailedBatch*(
+    p: KafkaProducer, err: ref CatchableError
+) {.gcsafe, raises: [].} =
+  ## A transactional batch could not be delivered (registration failed, or a send/lock-acquire
+  ## was cancelled mid-flush): poison the txn so commitTransaction's post-flush `tsError/tsFatal`
+  ## guard refuses to commit silently-missing records (EOS). Mirrors doSendWithRetry's terminal
+  ## handling: a broker API error picks tsFatal/tsError by class, transport/cancel is abortable.
+  if p.transactionalId.isNone:
+    return
+  if err of KafkaApiError:
+    p.transitionToError((ref KafkaApiError)(err).errorCode)
+  else:
+    if not p.tryTransition(tsError):
+      warnTransitionFailed(p, tsError, "poisonTxnOnFailedBatch")
+
+proc poisonTxnOnUnjoined*(
+    p: KafkaProducer, scope: TxnScope, err: ref CatchableError
+): bool {.gcsafe, discardable, raises: [].} =
+  ## Poison the txn for a `send` / `sendOffsetsToTransaction` that failed before
+  ## joining it, so a caller swallowing the error cannot commit without it (a cancel
+  ## included: the caller cannot tell whether it had joined). Only the txn the call
+  ## was made in (`scope`), while open or committing (the call still counts toward
+  ## `unjoined`, so a commit has not passed its post-flush guard yet), or already
+  ## poisoned, so a fatal error still escalates it to tsFatal. True when it poisoned
+  ## a txn that was not poisoned yet.
+  if p.txnScope != scope or p.txnState notin {tsInTransaction, tsCommitting, tsError}:
+    return false
+  let wasPoisoned = p.txnState == tsError
+  p.poisonTxnOnFailedBatch(err)
+  not wasPoisoned
 
 proc markPartitionForTxn*(p: KafkaProducer, tp: TopicPartition) =
   if p.transactionalId.isNone or tp in p.txnPartitions:
@@ -529,7 +630,8 @@ proc sendOffsetsToTransaction*(
   ## Commit consumer offsets inside the current transaction (consume-process-
   ## produce / EOS). Each value in `offsets` is the next offset to read — the last
   ## processed record's offset + 1 — as in the consumer's own commits; committing
-  ## the record's own offset re-delivers it after a restart or rebalance.
+  ## the record's own offset re-delivers it after a restart or rebalance. Await it
+  ## before committing (like a `send`, a failed or pending call refuses the commit).
   ##
   ## Success emits `producer.txn.send_offsets`; transport / cancel emit
   ## `producer.txn.send_offsets.error` (`error_code` / `error_class`), while refused
@@ -540,14 +642,17 @@ proc sendOffsetsToTransaction*(
   ## stale consumer generation (KIP-447); `initUnfencedConsumerGroupMetadata` is the
   ## deliberate pre-447 form. Re-validated here, before any wire bytes, so a half-set
   ## or later-mutated pair is refused instead of silently unfenced.
-  # A commit and a synchronous beginTransaction can open the next txn while this
-  # awaits, and the state alone reads tsInTransaction again.
-  let txnSeq = p.txnSeq
   validateConsumerGroupMetadata(groupMetadata)
-  # Before the awaits too, so a call outside a txn fails as such, not as a replaced txn.
-  if p.txnState != tsInTransaction:
-    raise newException(KafkaError, "must be in transaction to send offsets")
+  # Before the awaits, so a call outside a txn fails as such, not as a replaced txn: a
+  # commit and a synchronous beginTransaction can open the next txn while this awaits.
+  let scope = p.currentTxnScope()
+  p.requireTxnScope(
+    scope, "must be in transaction to send offsets", "sendOffsetsToTransaction"
+  )
 
+  # Counted like a send until the offsets are in, so a commit that wins txnLock first
+  # refuses instead of finalizing without them.
+  inc scope.unjoined
   var locked = false
   try:
     # Resolve a deferred epoch bump before txnLock (the single-flight gate must not
@@ -555,13 +660,7 @@ proc sendOffsetsToTransaction*(
     await p.ensureEpochBumped()
     await p.txnLock.acquire()
     locked = true
-    if p.txnState != tsInTransaction:
-      raise newException(KafkaError, "must be in transaction to send offsets")
-    if p.txnSeq != txnSeq:
-      raise newException(
-        KafkaError,
-        "transaction changed during sendOffsetsToTransaction (a later transaction is open)",
-      )
+    p.requireTxnUnchanged(scope, "sendOffsetsToTransaction")
 
     let addReq = AddOffsetsToTxnRequest(
       transactionalId: p.transactionalId.get,
@@ -632,32 +731,22 @@ proc sendOffsetsToTransaction*(
     # and API errors already emit producer.txn.error / fatal.
     emitMetric(p.metricsHook, meProducerTxnSendOffsets, noTags, 1)
   except KafkaError as offsetsErr:
-    # Poison before re-raising so a later commitTransaction is refused by the
-    # post-flush tsError/tsFatal guard, instead of committing offsets that never
-    # reached the coordinator (EOS violation). An API error picks tsFatal vs tsError
-    # by class; a transport error is abortable. The guard keeps a wrong-state
-    # rejection from poisoning an unrelated committing/aborting txn, or a later one.
-    if p.txnSeq == txnSeq and p.txnState == tsInTransaction:
-      if offsetsErr of KafkaApiError:
-        p.transitionToError((ref KafkaApiError)(offsetsErr).errorCode)
-      else:
-        if not p.tryTransition(tsError):
-          warnTransitionFailed(p, tsError, "sendOffsetsToTransaction transport error")
-        # tryTransition emits no producer.txn.error; this is the commit.error
-        # analogue for a silent abortable poison.
-        emitMetric(
-          p.metricsHook,
-          meProducerTxnSendOffsetsError,
-          txnErrorTags(kafkaErrorTag(offsetsErr), $errorClassToCstring(ecUnknown)),
-          1,
-        )
+    # Poison before re-raising, instead of letting a later commit finalize without
+    # offsets that never reached the coordinator (EOS violation).
+    if p.poisonTxnOnUnjoined(scope, offsetsErr) and not (offsetsErr of KafkaApiError):
+      # A transport poison emits no producer.txn.error; this is the commit.error
+      # analogue for it.
+      emitMetric(
+        p.metricsHook,
+        meProducerTxnSendOffsetsError,
+        txnErrorTags(kafkaErrorTag(offsetsErr), $errorClassToCstring(ecUnknown)),
+        1,
+      )
     raise
-  except CancelledError:
+  except CancelledError as e:
     # A cancel before the offsets committed, while waiting for the bump or txnLock
     # included, would let a later commit EndTxn(commit) a txn missing them; abortable.
-    if p.txnSeq == txnSeq and p.txnState == tsInTransaction:
-      if not p.tryTransition(tsError):
-        warnTransitionFailed(p, tsError, "sendOffsetsToTransaction cancellation")
+    if p.poisonTxnOnUnjoined(scope, e):
       emitMetric(
         p.metricsHook,
         meProducerTxnSendOffsetsError,
@@ -666,6 +755,7 @@ proc sendOffsetsToTransaction*(
       )
     raise
   finally:
+    dec scope.unjoined
     if locked:
       p.txnLock.releaseSafely("producer.sendOffsetsToTransaction")
 

@@ -2841,6 +2841,8 @@ proc newJoinTestProducer(
     partitioner: CustomPartitioner = nil,
     lingerMs = 0'i32,
     maxPendingRecords = 10_000'i32,
+    maxPendingFireAndForget = 1000'i32,
+    metricsHook: MetricsHook = nil,
 ): KafkaProducer =
   ## A transactional producer mid-transaction, over a cluster that already knows topic
   ## "t" (3 partitions), so resolving a partition never reaches a broker.
@@ -2857,6 +2859,8 @@ proc newJoinTestProducer(
     customPartitioner = partitioner,
     lingerMs = lingerMs,
     maxPendingRecords = maxPendingRecords,
+    maxPendingFireAndForget = maxPendingFireAndForget,
+    metricsHook = metricsHook,
   )
   result.setTxnState(tsInTransaction)
 
@@ -2985,6 +2989,39 @@ suite "Producer: a send failing before its record joins the txn":
         msg = e.msg
       check not rejected
       check msg == "must call beginTransaction before send"
+      await p.close()
+
+    waitFor body()
+
+  test "a send in a poisoned txn or a fatal producer is refused as such":
+    ## Regression: both were told to call beginTransaction, which a poisoned txn
+    ## (abort it first) and a fatal producer (close it) refuse.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      p.setTxnState(tsError)
+      var sendErr = ""
+      try:
+        discard await p.send("t", @[1'u8])
+      except KafkaError as e:
+        sendErr = e.msg
+      check sendErr ==
+        "cannot send: the transaction failed and must be aborted (state: tsError)"
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "t", partition: 0'i32)] = 10'i64
+      var offsetsErr = ""
+      try:
+        await p.sendOffsetsToTransaction(offsets, "test-group")
+      except KafkaError as e:
+        offsetsErr = e.msg
+      check offsetsErr ==
+        "cannot sendOffsetsToTransaction: the transaction failed and must be aborted (state: tsError)"
+      p.setTxnState(tsFatal)
+      sendErr = ""
+      try:
+        discard await p.send("t", @[1'u8])
+      except KafkaError as e:
+        sendErr = e.msg
+      check sendErr == "producer is in a fatal state and must be closed"
       await p.close()
 
     waitFor body()
@@ -3289,6 +3326,480 @@ suite "Producer: a send failing before its record joins the txn":
       # to register its partition with.
       p.failBatchFuturesForTest(tp, newException(KafkaError, "test teardown"))
       await p.close()
+
+    waitFor body()
+
+suite "Producer: commit and abort close their transaction when called":
+  ## Regression: a commit left tsInTransaction only once it held txnLock, so a send
+  ## made while it waited was counted as one yet to join, and the commit refused.
+  ## A call made after commit/abort is now refused instead, and each finalize acts
+  ## only on the txn it was called in.
+  test "a send made while a commit waits for txnLock leaves that commit alone":
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      # Held, so the commit parks before it takes the lock.
+      await p.acquireTxnLock()
+      let commitFut = p.commitTransaction()
+      check not commitFut.finished
+      let sendFut = p.send("t", @[1'u8])
+      p.releaseTxnLock()
+      var commitErr = ""
+      try:
+        await commitFut
+      except KafkaError as e:
+        commitErr = e.msg
+      check commitErr == ""
+      # Nothing reached the coordinator, so the commit finalized locally.
+      check p.txnState == tsReady
+      check await sendFut.withTimeout(2.seconds)
+      check sendFut.failed()
+      if sendFut.failed():
+        check sendFut.error.msg ==
+          "cannot send: commitTransaction or abortTransaction was already called"
+      await p.close()
+
+    waitFor body()
+
+  test "sendOffsetsToTransaction made while an abort waits is refused":
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "t", partition: 0'i32)] = 10'i64
+      # Parks the abort on a deferred epoch bump, before it takes txnLock.
+      p.holdEpochBumpGate()
+      let abortFut = p.abortTransaction()
+      check not abortFut.finished
+      let offsetsFut = p.sendOffsetsToTransaction(offsets, "test-group")
+      p.releaseEpochBumpGate()
+      await abortFut
+      check p.txnState == tsReady
+      check offsetsFut.finished
+      check offsetsFut.failed()
+      if offsetsFut.failed():
+        check offsetsFut.error.msg ==
+          "cannot sendOffsetsToTransaction: commitTransaction or abortTransaction was already called"
+      await p.close()
+
+    waitFor body()
+
+  test "a commit that takes txnLock ahead of an earlier sendOffsetsToTransaction is refused":
+    ## Regression: only sends were counted, so a commit that won the lock finalized
+    ## the txn without offsets requested before it, and the offsets call failed after.
+    proc body() {.async: (raises: [Exception]).} =
+      var offsetsErrors = 0
+      let hook: MetricsHook = proc(
+          event: cstring, tags: openArray[(cstring, cstring)], value: int64
+      ) {.gcsafe, raises: [].} =
+        if $event == "producer.txn.send_offsets.error":
+          inc offsetsErrors
+
+      let p = newJoinTestProducer(metricsHook = hook)
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "t", partition: 0'i32)] = 10'i64
+      p.holdEpochBumpGate()
+      let offsetsFut = p.sendOffsetsToTransaction(offsets, "test-group")
+      check not offsetsFut.finished
+      # The bump settles, and the commit takes txnLock before the parked call resumes.
+      p.releaseEpochBumpGate()
+      let commitFut = p.commitTransaction()
+      var commitErr = ""
+      try:
+        await commitFut
+      except KafkaError as e:
+        commitErr = e.msg
+      check "cannot commit" in commitErr
+      check "have not joined" in commitErr
+      check p.txnState == tsError
+      var offsetsErr = ""
+      try:
+        await offsetsFut
+      except KafkaError as e:
+        offsetsErr = e.msg
+      check offsetsErr ==
+        "transaction state changed during sendOffsetsToTransaction (now tsError)"
+      # A refusal of an already poisoned txn, not a failed offsets commit.
+      check offsetsErrors == 0
+      await p.close()
+
+    waitFor body()
+
+  test "an abort whose transaction ended while it waited leaves the next one alone":
+    ## Regression: the abort re-checked the state alone, which the next txn restores
+    ## to tsInTransaction, so it aborted a txn begun after it was called.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      p.holdEpochBumpGate()
+      let abortFut = p.abortTransaction()
+      check not abortFut.finished
+      # Meanwhile the txn the abort was called in ended and the next one began.
+      p.setTxnState(tsReady)
+      p.beginTransaction()
+      p.releaseEpochBumpGate()
+      var msg = ""
+      try:
+        await abortFut
+      except KafkaError as e:
+        msg = e.msg
+      check msg ==
+        "cannot abort: its transaction ended while it waited (a later transaction is open)"
+      check p.txnState == tsInTransaction
+      await p.close()
+
+    waitFor body()
+
+  test "an abort with no transaction in progress leaves the finished one's ending":
+    ## Regression: the abort marked the committed txn's scope abort-called before it
+    ## was refused for having no txn to abort.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      let scope = p.txnScope
+      await p.commitTransaction()
+      check p.txnState == tsReady
+      var msg = ""
+      try:
+        await p.abortTransaction()
+      except KafkaError as e:
+        msg = e.msg
+      check "cannot abort: not in transaction" in msg
+      check scope.ending == teCommitCalled
+      await p.close()
+
+    waitFor body()
+
+  test "a commit cancelled before it takes txnLock leaves the transaction closed":
+    ## A send made after it is still refused, and another commit finishes the txn.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      await p.acquireTxnLock()
+      let first = p.commitTransaction()
+      await first.cancelAndWait()
+      p.releaseTxnLock()
+      check first.cancelled()
+      check p.txnState == tsInTransaction
+      var msg = ""
+      try:
+        discard await p.send("t", @[1'u8])
+      except KafkaError as e:
+        msg = e.msg
+      check msg ==
+        "cannot send: commitTransaction or abortTransaction was already called"
+      check p.txnState == tsInTransaction
+      await p.commitTransaction()
+      check p.txnState == tsReady
+      await p.close()
+
+    waitFor body()
+
+  test "a commit made after a cancelled abort is refused":
+    ## The abort left the txn open in tsInTransaction, but the records were meant
+    ## to be discarded, so only another abort may finish it.
+    proc body() {.async: (raises: [Exception]).} =
+      var commitErrors = 0
+      let hook: MetricsHook = proc(
+          event: cstring, tags: openArray[(cstring, cstring)], value: int64
+      ) {.gcsafe, raises: [].} =
+        if $event == "producer.txn.commit.error":
+          inc commitErrors
+
+      let p = newJoinTestProducer(metricsHook = hook)
+      await p.acquireTxnLock()
+      let abortFut = p.abortTransaction()
+      await abortFut.cancelAndWait()
+      p.releaseTxnLock()
+      check abortFut.cancelled()
+      check p.txnState == tsInTransaction
+      var msg = ""
+      try:
+        await p.commitTransaction()
+      except KafkaError as e:
+        msg = e.msg
+      check msg == "cannot commit: abortTransaction was already called"
+      # Reported like every other refused commit.
+      check commitErrors == 1
+      check p.txnState == tsInTransaction
+      await p.abortTransaction()
+      check p.txnState == tsReady
+      # Once the abort finished, a commit is refused for the missing txn instead.
+      msg = ""
+      try:
+        await p.commitTransaction()
+      except KafkaError as e:
+        msg = e.msg
+      check "cannot commit: not in transaction" in msg
+      await p.close()
+
+    waitFor body()
+
+  test "a call made while a commit finalizes is refused as already called":
+    ## Regression: once the commit had moved the state to tsCommitting, the refusal
+    ## read as if no transaction had been begun.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      # Parks the commit in tsCommitting, waiting on an in-flight flush.
+      let gate = newFuture[void]("test-gate")
+      let inflight = p.simulateInflightFlushForTest(gate)
+      let commitFut = p.commitTransaction()
+      check p.txnState == tsCommitting
+      var sendErr = ""
+      try:
+        discard await p.send("t", @[1'u8])
+      except KafkaError as e:
+        sendErr = e.msg
+      check sendErr ==
+        "cannot send: commitTransaction or abortTransaction was already called"
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "t", partition: 0'i32)] = 10'i64
+      var offsetsErr = ""
+      try:
+        await p.sendOffsetsToTransaction(offsets, "test-group")
+      except KafkaError as e:
+        offsetsErr = e.msg
+      check offsetsErr ==
+        "cannot sendOffsetsToTransaction: commitTransaction or abortTransaction was already called"
+      gate.complete()
+      await inflight
+      await commitFut
+      check p.txnState == tsReady
+      await p.close()
+
+    waitFor body()
+
+  test "a fire-and-forget send waiting for a slot does not join a later transaction":
+    ## Regression: the queued task read the txn only once it got its slot, so a call
+    ## made in one txn, or outside any, joined the next one begun while it waited.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer(
+        lingerMs = 60_000, maxPendingRecords = 1, maxPendingFireAndForget = 1
+      )
+      let tp = TopicPartition(topic: "t", partition: 0)
+      # The only pending-record permit, so the first send parks holding the only slot.
+      check await p.tryAcquirePendingRecord()
+      var firstErr = ""
+      var secondErr = ""
+      var thirdErr = ""
+      proc first(
+          res: ProduceResult, err: ref KafkaError
+      ) {.closure, gcsafe, raises: [].} =
+        if err != nil:
+          firstErr = err.msg
+
+      proc second(
+          res: ProduceResult, err: ref KafkaError
+      ) {.closure, gcsafe, raises: [].} =
+        if err != nil:
+          secondErr = err.msg
+
+      proc third(
+          res: ProduceResult, err: ref KafkaError
+      ) {.closure, gcsafe, raises: [].} =
+        if err != nil:
+          thirdErr = err.msg
+
+      await p.sendFireAndForget("t", @[1'u8], partition = 0, callback = first)
+      let queued = p.sendFireAndForget("t", @[2'u8], partition = 0, callback = second)
+      check not queued.finished
+      # Meanwhile the txn both calls were made in ended, a third call came outside any
+      # txn, and the next one began.
+      p.setTxnState(tsReady)
+      let outside = p.sendFireAndForget("t", @[3'u8], partition = 0, callback = third)
+      p.beginTransaction()
+      p.releasePendingRecordForTest()
+      await queued
+      await outside
+      let deadline = Moment.now() + 2.seconds
+      while (firstErr.len == 0 or secondErr.len == 0 or thirdErr.len == 0) and
+          Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      check "transaction changed during send" in firstErr
+      check secondErr ==
+        "cannot send: its transaction ended while it waited (a later transaction is open)"
+      check thirdErr == "must call beginTransaction before send"
+      check p.txnState == tsInTransaction
+      check not p.hasBatch(tp)
+      if p.hasBatch(tp):
+        # close() would flush it, and this producer has no coordinator to register with.
+        p.failBatchFuturesForTest(tp, newException(KafkaError, "test teardown"))
+      await p.close()
+
+    waitFor body()
+
+  test "a fire-and-forget send whose producer turned fatal while it waited says so":
+    ## Regression: the queued send captured an open txn, then failed as if made
+    ## outside one, telling the operator to begin a txn the fatal producer refuses.
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer(
+        lingerMs = 60_000, maxPendingRecords = 1, maxPendingFireAndForget = 1
+      )
+      let tp = TopicPartition(topic: "t", partition: 0)
+      # The only pending-record permit, so the first send parks holding the only slot.
+      check await p.tryAcquirePendingRecord()
+      var queuedErr = ""
+      proc onQueued(
+          res: ProduceResult, err: ref KafkaError
+      ) {.closure, gcsafe, raises: [].} =
+        if err != nil:
+          queuedErr = err.msg
+
+      await p.sendFireAndForget("t", @[1'u8], partition = 0)
+      let queued = p.sendFireAndForget("t", @[2'u8], partition = 0, callback = onQueued)
+      check not queued.finished
+      p.setTxnState(tsFatal)
+      p.releasePendingRecordForTest()
+      await queued
+      let deadline = Moment.now() + 2.seconds
+      while queuedErr.len == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      check queuedErr == "producer is in a fatal state and must be closed"
+      check not p.hasBatch(tp)
+      if p.hasBatch(tp):
+        p.failBatchFuturesForTest(tp, newException(KafkaError, "test teardown"))
+      await p.close()
+
+    waitFor body()
+
+  test "a commit cancelled once txnLock is granted still releases it":
+    ## The caller enters its try/finally only after closeAndLockTxn resumes it, which
+    ## is safe: chronos does not cancel a future whose awaited child already finished.
+    proc body() {.async: (raises: [Exception]).} =
+      for ticks in 0 .. 6:
+        let p = newJoinTestProducer()
+        await p.acquireTxnLock()
+        let commitFut = p.commitTransaction()
+        # Grant the lock to the parked commit, then cancel it `ticks` turns later.
+        p.releaseTxnLock()
+        for _ in 0 ..< ticks:
+          await sleepAsync(0.milliseconds)
+        commitFut.cancelSoon()
+        try:
+          await commitFut
+        except CancelledError, KafkaError:
+          discard
+        check not p.isTxnLocked()
+        await p.close()
+
+    waitFor body()
+
+  test "an abort called after a waiting commit does not refuse that commit":
+    proc body() {.async: (raises: [Exception]).} =
+      let p = newJoinTestProducer()
+      await p.acquireTxnLock()
+      let commitFut = p.commitTransaction()
+      let abortFut = p.abortTransaction()
+      p.releaseTxnLock()
+      await commitFut
+      check p.txnState == tsReady
+      var msg = ""
+      try:
+        await abortFut
+      except KafkaError as e:
+        msg = e.msg
+      check "cannot abort: not in transaction" in msg
+      await p.close()
+
+    waitFor body()
+
+  test "a commit or abort cancelled while waiting for txnLock reports its error":
+    ## Regression: the waits ran outside the try that emits the error metric, so a
+    ## call failing there left its txn closed without reporting it.
+    proc body() {.async: (raises: [Exception]).} =
+      var commitErrors, abortErrors: seq[string]
+      let hook: MetricsHook = proc(
+          event: cstring, tags: openArray[(cstring, cstring)], value: int64
+      ) {.gcsafe, raises: [].} =
+        var code = ""
+        for (k, v) in tags:
+          if $k == "error_code":
+            code = $v
+        if $event == "producer.txn.commit.error":
+          commitErrors.add(code)
+        elif $event == "producer.txn.abort.error":
+          abortErrors.add(code)
+
+      let p = newJoinTestProducer(metricsHook = hook)
+      await p.acquireTxnLock()
+      let commitFut = p.commitTransaction()
+      await commitFut.cancelAndWait()
+      check commitFut.cancelled()
+      check commitErrors == @["CANCELLED"]
+      let abortFut = p.abortTransaction()
+      await abortFut.cancelAndWait()
+      check abortFut.cancelled()
+      check abortErrors == @["CANCELLED"]
+      # The lock neither call took is still the test's.
+      check p.isTxnLocked()
+      p.releaseTxnLock()
+      await p.abortTransaction()
+      check p.txnState == tsReady
+      await p.close()
+
+    waitFor body()
+
+  test "a commit or abort failing on the deferred epoch bump reports its error":
+    ## Regression: the bump ran outside the try that emits the error metric, so a
+    ## commit or abort failing there left its txn closed without reporting it.
+    proc body() {.async: (raises: [Exception]).} =
+      let fb = newFakeBroker()
+      let port = int32(fb.address().port)
+      # ApiVersions leaves InitProducerId out, so the bump fails UNSUPPORTED_VERSION.
+      proc handler() {.async: (raises: []).} =
+        try:
+          let av = await fb.nextRequest(timeout = 2.seconds)
+          await av.respond(
+            buildApiVersionsResponseBody(
+              0'i16,
+              [
+                FakeApiVersion(
+                  apiKey: int16(ord(akApiVersions)), minVersion: 0, maxVersion: 0
+                )
+              ],
+            )
+          )
+        except CatchableError:
+          discard
+
+      let handlerFut = handler()
+      var commitErrors, abortErrors: seq[string]
+      let hook: MetricsHook = proc(
+          event: cstring, tags: openArray[(cstring, cstring)], value: int64
+      ) {.gcsafe, raises: [].} =
+        var code = ""
+        for (k, v) in tags:
+          if $k == "error_code":
+            code = $v
+        if $event == "producer.txn.commit.error":
+          commitErrors.add(code)
+        elif $event == "producer.txn.abort.error":
+          abortErrors.add(code)
+
+      let p = newJoinTestProducer(metricsHook = hook)
+      let b = newBroker(0'i32, "127.0.0.1", port, "txn-bump-unsupported")
+      p.setTxnCoordinator(b)
+      await b.connect()
+      p.setPendingEpochBump(true)
+      var commitRaised = false
+      try:
+        await p.commitTransaction()
+      except KafkaApiError:
+        commitRaised = true
+      check commitRaised
+      check commitErrors == @["UNSUPPORTED_VERSION"]
+      var abortRaised = false
+      try:
+        await p.abortTransaction()
+      except KafkaApiError:
+        abortRaised = true
+      check abortRaised
+      check abortErrors == @["UNSUPPORTED_VERSION"]
+      check not p.isTxnLocked()
+      p.setPendingEpochBump(false)
+      await p.abortTransaction()
+      check p.txnState == tsReady
+
+      handlerFut.cancelSoon()
+      awaitDrain(handlerFut, 1.seconds)
+      await b.close()
+      await p.close()
+      await fb.close()
 
     waitFor body()
 
@@ -3866,6 +4377,78 @@ suite "Producer: sendOffsetsToTransaction poisons txn on failure":
 
   test "AddOffsetsToTxn fatal (PRODUCER_FENCED) -> tsFatal":
     waitFor runSendOffsetsFailureCase(tsFatal, 90'i16)
+
+  test "a fatal AddOffsetsToTxn error escalates a transaction already poisoned":
+    ## Regression: only an open or committing txn was poisoned, so PRODUCER_FENCED
+    ## arriving after a concurrent failure had set tsError left the producer
+    ## abortable, not fatal (a failed send already escalated).
+    proc body() {.async: (raises: [Exception]).} =
+      let fb = newFakeBroker()
+      let host = "127.0.0.1"
+      let port = int32(fb.address().port)
+      let cluster = newCluster(@[host & ":" & $port], clientId = "sotx-test")
+      let p = newKafkaProducer(
+        cluster,
+        transactionalId = some("test-txn"),
+        enableIdempotence = true,
+        maxRetries = 0,
+        retryBackoffMs = 1,
+        timeoutMs = 1500,
+      )
+      seedTxnProducer(p)
+      let coord = newBroker(
+        nodeId = 0'i32,
+        host = host,
+        port = port,
+        clientId = "sotx-coord",
+        requestTimeoutMs = 1000,
+        connectTimeoutMs = 1000,
+      )
+      p.setTxnCoordinator(coord)
+
+      proc handler() {.async: (raises: []).} =
+        try:
+          let av = await fb.nextRequest(timeout = 2.seconds)
+          await av.respond(
+            buildApiVersionsResponseBody(
+              0'i16,
+              [
+                FakeApiVersion(
+                  apiKey: int16(ord(akApiVersions)), minVersion: 0, maxVersion: 0
+                ),
+                FakeApiVersion(
+                  apiKey: int16(ord(akAddOffsetsToTxn)), minVersion: 0, maxVersion: 0
+                ),
+              ],
+            )
+          )
+          let req = await fb.nextRequest(timeout = 5.seconds)
+          # A lock-free failure (another send's terminal error) poisons the txn
+          # while the request is on the wire.
+          p.setTxnState(tsError)
+          await req.respond(buildAddOffsetsToTxnResponseBody(keProducerFenced.toInt16))
+        except CatchableError:
+          discard
+
+      let handlerFut = handler()
+      var offsets = initTable[TopicPartition, int64]()
+      offsets[TopicPartition(topic: "txn-topic", partition: 0'i32)] = 10'i64
+      var raisedCode = keNone
+      try:
+        await p.sendOffsetsToTransaction(offsets, "test-group")
+      except KafkaApiError as e:
+        raisedCode = e.errorCode
+      check raisedCode == keProducerFenced
+      check p.txnState == tsFatal
+
+      await p.close()
+      handlerFut.cancelSoon()
+      awaitDrain(handlerFut, 1.seconds)
+      await coord.close()
+      await fb.close()
+      await cluster.close()
+
+    waitFor body()
 
   test "sendOffsetsToTransaction transport failure emits producer.txn.send_offsets.error":
     ## transaction.send-offsets-error: tryTransition(tsError) on transport

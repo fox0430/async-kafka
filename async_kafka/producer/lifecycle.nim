@@ -247,6 +247,7 @@ proc newKafkaProducer*(
     transactionalId: transactionalId,
     transactionTimeoutMs: transactionTimeoutMs,
     txnState: tsUninitialized,
+    txnScope: TxnScope(),
     txnLock: newAsyncLock(),
     errorHandler: errorHandler,
     partitionStrategy: partitionStrategy,
@@ -367,8 +368,7 @@ proc closeImpl(p: KafkaProducer) {.async: (raises: []).} =
   # would only confuse the coordinator. `txnStarted` is checked with the partition
   # sets so an offsets-only transaction (nothing in `txnPartitions`) is still
   # aborted rather than left to time out.
-  if p.transactionalId.isSome and
-      p.txnState in {tsInTransaction, tsError, tsCommitting, tsAborting} and
+  if p.transactionalId.isSome and p.txnState in txnInProgressStates and
       p.txnCoordinator != nil and
       (p.txnPartitions.len > 0 or p.txnPendingPartitions.len > 0 or p.txnStarted):
     # Bound the abort by timeoutMs so a held txnLock or unresponsive coordinator
