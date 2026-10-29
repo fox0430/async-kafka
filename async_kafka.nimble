@@ -18,6 +18,7 @@ requires "supersnappy >= 2.0.0"
 requires "nimcrypto >= 0.7.0"
 requires "bearssl >= 0.2.13"
 requires "https://github.com/fox0430/nim_zstd == 0.2.1"
+requires "lz4 >= 0.1.0"
 
 # Test hook defines come from tests/config.nims.
 const backendFlag = "-d:asyncBackend=chronos"

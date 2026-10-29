@@ -412,9 +412,44 @@ suite "Integration: Compressed Producer and Consumer":
     waitFor codecRoundTrip(ccSnappy, "snappy")
 
   test "Produce and consume with lz4 compression":
-    ## liblz4 is resolved with dlopen rather than linked, so this is the only path
-    ## that proves a real broker accepts the frames this build emits.
+    ## LZ4 comes from a pure Nim port, so the broker's own decompressor is the
+    ## independent check that the frames it emits are standard LZ4.
     waitFor codecRoundTrip(ccLz4, "lz4")
+
+  test "Produce and consume an lz4 batch larger than one 64 KiB block":
+    ## Kafka Java's LZ4 reader rejects linked blocks, which only a frame of more
+    ## than one block can carry.
+    proc testBody() {.async: (raises: [Exception]).} =
+      let topic = "test-lz4-multiblock"
+      await createTopic(topic)
+      var payload = newSeq[byte](200_000)
+      for i in 0 ..< payload.len:
+        payload[i] = byte((i * 31) mod 251)
+
+      let prodCluster = newCluster(@[BootstrapBroker], "test-producer-lz4-multiblock")
+      let producer = newKafkaProducer(prodCluster, acks = 1, compression = ccLz4)
+      discard await producer.send(topic, payload, partition = 0)
+      await producer.close()
+      await prodCluster.close()
+
+      var config = initConsumerConfig(
+        bootstrapBrokers = @[BootstrapBroker],
+        groupId = testGroupId("lz4-multiblock"),
+        topics = @[topic],
+        clientId = "test-consumer-lz4-multiblock",
+      )
+      config.offsetResetPolicy = orpEarliest
+      config.autoCommit = false
+
+      let consumer = newKafkaConsumer(config)
+      await consumer.start()
+      let records = await pollBatch(consumer, 1, seconds(30))
+      check records.len >= 1
+      if records.len >= 1:
+        check records[0].value == some(payload)
+      await consumer.close()
+
+    waitFor testBody()
 
   test "Produce and consume with zstd compression":
     ## Zstd comes from the pinned fork; the broker's own decompressor is the

@@ -20,7 +20,6 @@ Async Apache Kafka client library in Nim
 ## Requirements
 
 - Nim >= 2.2.8
-- LZ4 (`liblz4`), only for LZ4 compression
 
 ## Platform support
 

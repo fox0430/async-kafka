@@ -57,7 +57,7 @@ proc main() {.async.} =
     enableIdempotence = true,
     lingerMs = 20,
     maxBatchRecords = 100,
-    compression = ccGzip, # ccSnappy and ccZstd are linked in; ccLz4 needs liblz4
+    compression = ccGzip, # or ccSnappy / ccLz4 / ccZstd
   )
   let keyed = newKafkaProducer(cluster, partitionStrategy = psKeyHash)
   let custom = newKafkaProducer(cluster, customPartitioner = onFirstKeyByte)

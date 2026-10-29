@@ -11,6 +11,7 @@ import pkg/zstd/common as rawzstdcommon
 import async_kafka/errors
 import async_kafka/protocol/[primitives, api_keys, messages, crc32c, compression, zstd]
 import async_kafka/protocol/lz4 as lz4mod
+import pkg/lz4 as lz4_lib
 
 proc toBytes(s: string): seq[byte] =
   cast[seq[byte]](s)
@@ -2190,12 +2191,15 @@ suite "LZ4 compression":
     check decompressed == empty
 
   test "lz4 decompress rejects a non-positive size limit":
-    # Non-empty input with maxSize <= 0 must raise rather than size dstBuf to
-    # an empty buffer and index addr dstBuf[0]. Empty input short-circuits to
-    # @[] before the guard, so it stays unaffected.
+    # Empty input short-circuits to @[] before the limit is looked at.
     let compressed = compressRecords("payload".toBytes, ccLz4)
     expect KafkaError:
       discard lz4mod.lz4Decompress(compressed, maxSize = 0)
+    expect KafkaError:
+      discard lz4mod.lz4Decompress(compressed, maxSize = -1)
+    # A frame with no content is still checked against the limit.
+    expect KafkaError:
+      discard lz4mod.lz4Decompress(lz4mod.lz4Compress(newSeq[byte](0)), maxSize = 0)
     check lz4mod.lz4Decompress(newSeq[byte](0), maxSize = 0).len == 0
 
   test "lz4 large data round-trip":
@@ -2274,18 +2278,26 @@ suite "LZ4 compression":
     expect KafkaError:
       discard lz4mod.lz4Decompress(truncated)
 
+  test "lz4 decompress rejects legacy frames":
+    # Legacy frames have no checksum or end mark, so a cut one would decode
+    # short without an error.
+    let payload = repeat("A", 4096).toBytes
+    let legacy = lz4_lib.compressLegacyFrame(payload)
+    expect KafkaError:
+      discard lz4mod.lz4Decompress(legacy)
+    # Also after a valid frame.
+    expect KafkaError:
+      discard lz4mod.lz4Decompress(lz4mod.lz4Compress(payload) & legacy)
+
   test "lz4 output between half of maxSize and maxSize is accepted":
-    # Regression: the growth loop used to raise as soon as doubling the
+    # Regression: the old liblz4 growth loop raised as soon as doubling its
     # buffer overshot maxSize, rejecting legitimate outputs in
-    # (initial buffer, maxSize]. 100 KB of zeros compresses to a few hundred
-    # bytes, so the initial buffer (compressed.len * 4 + 256) is far below
-    # the output and the loop must double-and-clamp its way up to exactly
-    # the output size without tripping the limit.
+    # (initial buffer, maxSize]. Kept as a boundary check on the limit.
     let original = newSeq[byte](100_000) # zeros: highly compressible
     let compressed = compressRecords(original, ccLz4)
-    check compressed.len < 10_000 # sanity: growth loop genuinely exercised
-    let decompressed = lz4mod.lz4Decompress(compressed, maxSize = 110_000)
-    check decompressed == original
+    check compressed.len < 10_000
+    check lz4mod.lz4Decompress(compressed, maxSize = 100_000) == original
+    check lz4mod.lz4Decompress(compressed, maxSize = 110_000) == original
     # A limit just below the real output still rejects.
     expect KafkaError:
       discard lz4mod.lz4Decompress(compressed, maxSize = 99_999)
@@ -4198,58 +4210,23 @@ suite "LZ4 frame codec":
   test "lz4Decompress of empty input is empty":
     check lz4mod.lz4Decompress(@[]) == newSeq[byte](0)
 
-  test "lz4 missing dynlib symbol is raised as KafkaError":
-    # liblz4 itself is present in CI; a symbol it does not export still
-    # produces a nil address that the production wrapper normalizes to
-    # LibraryError. The outer wrap turns that into KafkaError.
-    var raised = false
-    var msg = ""
-    try:
-      lz4mod.lz4CallMissingSymbol()
-    except KafkaError as e:
-      raised = true
-      msg = e.msg
-    check raised
-    check "lz4 native library error" in msg
-    check "could not find symbol" in msg
+  test "lz4 frames use the layout Kafka Java reads":
+    # KafkaLZ4BlockInputStream rejects linked blocks, so a multi-block frame
+    # must keep them independent. FLG 0x60: version 01, independent blocks, no
+    # block checksum, no content size, no content checksum.
+    var payload = newSeq[byte](200_000)
+    for i in 0 ..< payload.len:
+      payload[i] = byte((i * 31) mod 251)
+    let compressed = lz4mod.lz4Compress(payload)
+    check compressed[0 .. 3] == @[0x04'u8, 0x22, 0x4D, 0x18]
+    check compressed[4] == 0x60'u8
+    check lz4mod.lz4Decompress(compressed) == payload
 
-  test "ensureCodecAvailable passes the linked codecs and lz4 on this host":
-    # gzip / snappy / zstd are linked into the binary, so the probe is a no-op
-    # for them; ccLz4 is present here because the suite above compresses with it.
-    for codec in [ccNone, ccGzip, ccSnappy, ccZstd]:
-      ensureCodecAvailable(codec)
-    ensureCodecAvailable(ccLz4)
-
-  test "ensureCodecAvailable reports a host without liblz4 as KafkaError":
-    # The probe runs at producer construction, so this is the failure a user
-    # sees there instead of a failed first send.
-    lz4mod.lz4BlockLoadForTest(true)
-    defer:
-      lz4mod.lz4BlockLoadForTest(false)
-    var raised = false
-    var msg = ""
-    try:
-      ensureCodecAvailable(ccLz4)
-    except KafkaError as e:
-      raised = true
-      msg = e.msg
-    check raised
-    check "ccLz4 requires the system liblz4" in msg
-    # The injection covers the lz4 load only; an unrelated codec still passes.
-    ensureCodecAvailable(ccZstd)
-
-  test "lz4 load resumes after a blocked probe":
-    lz4mod.lz4BlockLoadForTest(true)
-    var blocked = false
-    try:
-      lz4mod.ensureLz4Loaded()
-    except KafkaError:
-      blocked = true
-    check blocked
-    lz4mod.lz4BlockLoadForTest(false)
-    # A failed probe must not poison the cached handle: the next call loads.
-    ensureCodecAvailable(ccLz4)
-    check lz4mod.lz4Decompress(lz4mod.lz4Compress(@[1'u8, 2, 3])) == @[1'u8, 2, 3]
+  test "lz4Decompress rejects a corrupted header checksum":
+    var compressed = lz4mod.lz4Compress("header checksum".toBytes)
+    compressed[6] = compressed[6] xor 0xFF'u8
+    expect KafkaError:
+      discard lz4mod.lz4Decompress(compressed)
 
 suite "toIsolationLevel":
   test "valid wire values map to enum":

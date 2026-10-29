@@ -8,7 +8,6 @@ import async_kafka/[errors, broker]
 import async_kafka/cluster {.all.}
 import async_kafka/internal/metrics
 import async_kafka/protocol/[messages, primitives, api_keys, compression]
-import async_kafka/protocol/lz4 as lz4mod
 import async_kafka/producer/producer
 import async_kafka/producer/types
 import async_kafka/producer/partitioner
@@ -937,12 +936,11 @@ suite "Producer: configuration validation":
         maxPendingRecords: int32 = 10_000,
         maxInFlightRequests: int32 = 5,
         transactionalId: Option[string] = none(string),
-        compression: CompressionCodec = ccNone,
     ) {.raises: [KafkaError].} =
       validateProducerConfig(
         lingerMs, acks, timeoutMs, transactionTimeoutMs, maxRetries, maxBatchRecords,
         maxBatchBytes, retryBackoffMs, maxPendingFireAndForget, maxPendingRecords,
-        maxInFlightRequests, transactionalId, compression,
+        maxInFlightRequests, transactionalId,
       )
 
     template rejected(expected: string, call: untyped) =
@@ -991,40 +989,6 @@ suite "Producer: configuration validation":
       maxPendingRecords = 1,
       maxInFlightRequests = 1,
     )
-    # ccLz4 is the one codec whose library is not linked; the LZ4 compression
-    # suite compresses with it.
-    validate(compression = ccLz4)
-    lz4mod.lz4BlockLoadForTest(true)
-    defer:
-      lz4mod.lz4BlockLoadForTest(false)
-    rejected("ccLz4 requires the system liblz4", validate(compression = ccLz4))
-
-  test "ccLz4 is probed when the producer is built, not when it first sends":
-    ## The library is resolved on first use, so nothing at build time catches a
-    ## host without liblz4. Both constructor overloads must reject the codec at
-    ## construction — the bootstrap one before it creates its Cluster.
-    proc testBody() {.async: (raises: [Exception]).} =
-      let cluster = newCluster(@["127.0.0.1:9092"])
-      lz4mod.lz4BlockLoadForTest(true)
-      var borrowedMessage, ownedMessage = ""
-      try:
-        discard newKafkaProducer(cluster, compression = ccLz4)
-      except KafkaError as e:
-        borrowedMessage = e.msg
-      try:
-        discard newKafkaProducer(@["127.0.0.1:9092"], compression = ccLz4)
-      except KafkaError as e:
-        ownedMessage = e.msg
-      lz4mod.lz4BlockLoadForTest(false)
-      check "ccLz4 requires the system liblz4" in borrowedMessage
-      check "ccLz4 requires the system liblz4" in ownedMessage
-
-      let producer = newKafkaProducer(cluster, compression = ccLz4)
-      check producer.isClosed() == false
-      await producer.close()
-      await cluster.close()
-
-    waitFor testBody()
 
   test "constructors reject an invalid transactionalId":
     let cluster = newCluster(@["127.0.0.1:9092"])

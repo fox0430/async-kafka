@@ -57,11 +57,6 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes liblz4-dev
-
       - name: Install Nim dependencies
         run: nimble install --accept --depsOnly
 
@@ -121,11 +116,6 @@ jobs:
         uses: nim-lang/setup-nimble-action@v1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes liblz4-dev
 
       - name: Install Nim dependencies
         run: nimble install --accept --depsOnly
@@ -202,11 +192,6 @@ jobs:
         uses: nim-lang/setup-nimble-action@v1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes liblz4-dev
 
       - name: Install Nim dependencies
         run: nimble install --accept --depsOnly

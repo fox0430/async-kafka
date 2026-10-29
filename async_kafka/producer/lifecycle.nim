@@ -24,13 +24,11 @@ proc validateProducerConfig*(
     maxPendingRecords: int32,
     maxInFlightRequests: int32,
     transactionalId: Option[string],
-    compression: CompressionCodec,
 ) {.raises: [KafkaError].} =
   ## Raise on any config the constructors reject. Shared so both `newKafkaProducer`
   ## overloads validate IDENTICALLY, and so the bootstrap-broker overload can
   ## validate BEFORE creating its own Cluster — a rejection must not leak an
-  ## already-constructed Cluster. `compression` is probed here because liblz4 is
-  ## resolved on first use, so this is the earliest it can be reported.
+  ## already-constructed Cluster.
   if lingerMs < 0:
     raise newException(KafkaError, "lingerMs must be >= 0, got " & $lingerMs)
   if acks notin {-1'i16, 0'i16, 1'i16}:
@@ -82,9 +80,6 @@ proc validateProducerConfig*(
           KafkaError,
           "transactionalId may only contain [a-zA-Z0-9._-], got '" & $c & "'",
         )
-  # Lazy `dlopen`: without this probe a missing codec first surfaces as a failed
-  # send, long after the configuration mistake.
-  ensureCodecAvailable(compression)
 
 proc newKafkaProducer*(
     cluster: Cluster,
@@ -110,8 +105,8 @@ proc newKafkaProducer*(
 ): KafkaProducer {.raises: [KafkaError].} =
   ## Build a producer over `cluster`. `validateProducerConfig` checks the numeric and
   ## enum knobs eagerly (acks, timeouts, batch caps, retries, in-flight limit,
-  ## transactional id, compression); transactional mode then forces idempotence,
-  ## `acks = -1`, and unbounded retries. The caller owns the producer via `close`.
+  ## transactional id); transactional mode then forces idempotence, `acks = -1`, and
+  ## unbounded retries. The caller owns the producer via `close`.
   ##
   ## Does NOT own `cluster`: `close()` leaves it open (see `ownsCluster`).
   ##
@@ -123,7 +118,6 @@ proc newKafkaProducer*(
   ##   - `timeoutMs`: broker-side wait for those acks; it is also the per-stage
   ##     budget `close` gives the transaction abort, the flush, and the drains.
   ##   - `compression`: `ccNone` (default), `ccGzip`, `ccSnappy`, `ccLz4`, `ccZstd`.
-  ##     `ccLz4` needs the system liblz4 and is refused here without it.
   ##   - `lingerMs`: how long a partition may wait for batch company; `0` sends
   ##     immediately. The batched path is the one `maxPendingRecords` backpressures.
   ##   - `maxBatchRecords` / `maxBatchBytes`: per-partition caps that seal and flush
@@ -161,7 +155,7 @@ proc newKafkaProducer*(
   validateProducerConfig(
     lingerMs, acks, timeoutMs, transactionTimeoutMs, maxRetries, maxBatchRecords,
     maxBatchBytes, retryBackoffMs, maxPendingFireAndForget, maxPendingRecords,
-    maxInFlightRequests, transactionalId, compression,
+    maxInFlightRequests, transactionalId,
   )
 
   var actualAcks = acks
@@ -298,7 +292,7 @@ proc newKafkaProducer*(
   validateProducerConfig(
     lingerMs, acks, timeoutMs, transactionTimeoutMs, maxRetries, maxBatchRecords,
     maxBatchBytes, retryBackoffMs, maxPendingFireAndForget, maxPendingRecords,
-    maxInFlightRequests, transactionalId, compression,
+    maxInFlightRequests, transactionalId,
   )
   let cluster = newCluster(
     bootstrapBrokers,
