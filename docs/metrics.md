@@ -148,5 +148,5 @@ exclusive, not additive).
 | `producer.txn.fatal` | count (1) | `error_code` | `transitionToError` moved the producer to terminal `tsFatal` for a fatal error class; only real state changes emit. |
 | `producer.txn.init` | count (1) | — | `initTransactions` completed `InitProducerId` and reached `tsReady`; refused inits raise and do not emit. |
 | `producer.txn.send_offsets` | count (1) | — | `AddOffsetsToTxn` and `TxnOffsetCommit` both succeeded; API failures raise earlier and do not emit this. |
-| `producer.txn.send_offsets.error` | count (1) | `error_class` + `error_code` | Offset commit poisoned the txn while `tsInTransaction`: a coordinator RPC failed (transport `error_code`) or was cancelled (`CANCELLED`). |
+| `producer.txn.send_offsets.error` | count (1) | `error_class` + `error_code` | Offset commit poisoned the txn while `tsInTransaction` or `tsCommitting`: a coordinator RPC failed (transport `error_code`) or was cancelled (`CANCELLED`). |
 

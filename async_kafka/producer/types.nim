@@ -66,6 +66,21 @@ type
     resetEpochAtEncode*: int64
     encodedBytes*: seq[byte]
 
+  TxnEnding* = enum
+    ## Which finalize was called on a txn, set before it awaits anything and never
+    ## cleared, even when that call fails or is cancelled.
+    teOpen
+    teCommitCalled
+    teAbortCalled ## Also refuses a later commit.
+
+  TxnScope* = ref object
+    ## One txn as the calls made in it captured it on entry (the state alone cannot
+    ## tell it from a later one).
+    unjoined*: int
+      ## `send` / `sendOffsetsToTransaction` calls yet to join it; a commit refuses
+      ## while any remain.
+    ending*: TxnEnding
+
   KafkaProducer* = ref object
     ## Bound to the chronos event loop that built it, and safe to share between the
     ## coroutines on that loop: `send` and the transaction calls serialize
@@ -160,12 +175,8 @@ type
       ## Validated at construction; `none` means a plain or idempotent producer.
     transactionTimeoutMs: int32
     txnState: TransactionState
-    txnSeq: int64
-      ## Bumped by every `beginTransaction`, so an awaiting call can tell its txn from
-      ## a later one (the state alone cannot).
-    txnUnjoinedSends: int
-      ## `send` calls of the current txn whose record has yet to join it. A commit
-      ## refuses while any remain: once it has begun they can no longer join.
+    txnScope: TxnScope
+      ## The current txn, replaced by every `beginTransaction`; never nil.
     txnLock: AsyncLock
     txnCoordinator: Broker
     txnPartitions: HashSet[TopicPartition]

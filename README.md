@@ -138,12 +138,22 @@ consume-process-produce loop commits the consumed offsets inside the same
 transaction; [`examples/transactions.nim`](examples/transactions.nim) is the
 complete program.
 
-Commit only after every `send` in the transaction has resolved. A failed `send`
-then leaves the transaction abort-only, and a cancelled one either still goes
-out with the commit or leaves it abort-only too, so a commit that succeeds never
-silently lacks the record. The exception is `KafkaRecordRejectedError` (a record
-over `maxBatchBytes`): the client refused that record before it touched the
-transaction, so the loop may skip it and still commit.
+Commit only after every `send` and `sendOffsetsToTransaction` in the
+transaction has resolved. A failed `send` then leaves the transaction
+abort-only, and a cancelled one either still goes out with the commit or leaves
+it abort-only too, so a commit that succeeds never silently lacks the record.
+The exception is `KafkaRecordRejectedError` (a record over `maxBatchBytes`): the
+client refused that record before it touched the transaction, so the loop may
+skip it and still commit.
+
+`commitTransaction` and `abortTransaction` close the transaction as soon as they
+are called: a `send` or `sendOffsetsToTransaction` made after that is refused
+and does not affect them. A commit that fails or is cancelled leaves the
+transaction closed: abort it, or retry the commit, which is refused when the
+failure left the transaction abort-only. A commit called after
+`abortTransaction` is refused, even if that abort failed or was cancelled; a
+commit already waiting when the abort is called goes ahead first: if it
+succeeds, the abort then fails, and if it fails, the abort proceeds.
 
 ### TLS
 

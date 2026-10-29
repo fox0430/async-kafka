@@ -799,42 +799,6 @@ proc failBatchFutures*(
   p.batches.del(tp)
   p.pendingBatchBytes.del(tp)
 
-proc poisonTxnOnFailedBatch(
-    p: KafkaProducer, err: ref CatchableError
-) {.gcsafe, raises: [].} =
-  ## A transactional batch could not be delivered (registration failed, or a send/lock-acquire
-  ## was cancelled mid-flush): poison the txn so commitTransaction's post-flush `tsError/tsFatal`
-  ## guard refuses to commit silently-missing records (EOS). Mirrors doSendWithRetry's terminal
-  ## handling: a broker API error picks tsFatal/tsError by class, transport/cancel is abortable.
-  if p.transactionalId.isNone:
-    return
-  if err of KafkaApiError:
-    p.transitionToError((ref KafkaApiError)(err).errorCode)
-  else:
-    if not p.tryTransition(tsError):
-      warnTransitionFailed(p, tsError, "poisonTxnOnFailedBatch")
-
-proc poisonTxnOnUnjoinedSend(
-    p: KafkaProducer, txnSeq: int64, err: ref CatchableError
-) {.gcsafe, raises: [].} =
-  ## Poison the txn for a `send` that failed before its record joined, so a caller
-  ## swallowing the error cannot commit without it (a cancel included: the caller
-  ## cannot tell whether the record had joined). Only the txn the send was called in
-  ## (`txnSeq`), while still open or committing: the send still counts toward
-  ## `txnUnjoinedSends`, so a committing txn has not passed the post-flush guard yet.
-  ## An already poisoned one too, so a fatal error (PRODUCER_FENCED, say) still
-  ## escalates it to tsFatal; an abortable one leaves it as is.
-  if p.txnSeq != txnSeq:
-    return
-  if p.txnState in {tsInTransaction, tsCommitting, tsError}:
-    p.poisonTxnOnFailedBatch(err)
-
-proc leaveUnjoinedSend(p: KafkaProducer, txnSeq: int64) {.raises: [].} =
-  ## Drop a `send` from `txnUnjoinedSends` once its record joined or it failed. One
-  ## counted in an earlier txn is left out: `beginTransaction` reset the count.
-  if p.txnSeq == txnSeq:
-    dec p.txnUnjoinedSends
-
 proc removeInflightFlush(p: KafkaProducer, marker: Future[void]) {.raises: [].} =
   ## Remove a flushBatch in-flight marker (identity-based, O(n)); idempotent when absent.
   let idx = p.inflightFlushFutures.find(marker)
@@ -1080,17 +1044,9 @@ proc renewLingerTimer*(p: KafkaProducer, tp: TopicPartition) {.gcsafe, raises: [
   p.lingerTimerEpoch[tp] = epoch
   p.lingerTimers[tp] = lingerTimeout(p, tp, epoch)
 
-proc sendTxnChange(p: KafkaProducer, txnSeq: int64): Option[string] {.raises: [].} =
-  ## Why the txn `send` was called in (`txnSeq`) can no longer take its record, or
-  ## `none` while it still can.
-  if p.txnState != tsInTransaction:
-    some("transaction state changed during send (now " & $p.txnState & ")")
-  elif p.txnSeq != txnSeq:
-    some("transaction changed during send (a later transaction is open)")
-  else:
-    none(string)
-
-proc assertBatchEnqueueable(p: KafkaProducer, txnSeq: int64) {.raises: [KafkaError].} =
+proc assertBatchEnqueueable(
+    p: KafkaProducer, scope: TxnScope
+) {.raises: [KafkaError].} =
   ## Re-check, under an already-held batchLock, that the producer still permits enqueueing a
   ## batched record; on failure it RELEASES the caller's pending-record permit and raises, so the
   ## caller's `finally` only releases the lock.
@@ -1098,12 +1054,12 @@ proc assertBatchEnqueueable(p: KafkaProducer, txnSeq: int64) {.raises: [KafkaErr
   ## Both guards must run in the SAME no-await region as the enqueue: past lsRunning enqueuing
   ## slips a record past failRemaining (leaking its future), past tsInTransaction it stays
   ## invisible to a commit/abort snapshot until it lands in `p.batches`; and once a later txn
-  ## is open (`txnSeq` moved on), the record would leak into that one.
+  ## is open (`txnScope` replaced), the record would leak into that one.
   if p.state != lsRunning:
     p.releasePendingRecordPermit()
     raise newException(KafkaClosedError, "producer is closed")
   if p.transactionalId.isSome:
-    let changed = p.sendTxnChange(txnSeq)
+    let changed = p.txnChange(scope, "send")
     if changed.isSome:
       p.releasePendingRecordPermit()
       raise newException(KafkaError, changed.get)
@@ -1155,38 +1111,23 @@ proc startFlush(p: KafkaProducer, tp: TopicPartition) {.async: (raises: []).} =
   else:
     spawnNoRaise p.flushBatch(tp)
 
-proc send*(
+proc sendScoped(
     p: KafkaProducer,
+    scope: TxnScope,
     topic: string,
     value: Option[seq[byte]],
-    key: Option[seq[byte]] = none(seq[byte]),
-    partition: int32 = -1,
-    headers: seq[RecordHeader] = @[],
-    timestamp: int64 = 0,
+    key: Option[seq[byte]],
+    partition: int32,
+    headers: seq[RecordHeader],
+    timestamp: int64,
 ): Future[ProduceResult] {.async: (raises: [KafkaError, CancelledError]).} =
-  ## Buffer one record for `topic` and resolve with its `ProduceResult` once acked. A negative
-  ## `partition` selects via the configured strategy (key hash when keyed); oversized records
-  ## raise before buffering. Inside a transaction the send joins it — commit only after it acked.
-  ## A send that fails before its record joins still poisons that transaction, so after a
-  ## failed or cancelled send (a timeout included) the commit either carries the record or is
-  ## refused; so is a commit made while the send has yet to join (one that `sendFireAndForget`
-  ## handed off while `maxPendingRecords` was full, say). The exception is
-  ## `KafkaRecordRejectedError` (an oversized record): the transaction stays committable, so
-  ## the caller may skip the record. The record never joins a later transaction begun while
-  ## the send awaited.
-  ##
-  ## A `none` value sends a tombstone (null value) for compacted topics; pair it
-  ## with a key so the broker can match the key to delete. A nil `seq[byte]` passed
-  ## to the `seq[byte]` overload stays an empty value, not a tombstone.
-  ##
-  ## A failure the producer's `errorHandler` diverts does not raise: the result's `status` is
-  ## `pstDropped`, `pstDeadLettered`, or `pstDeadLetterFailed` (with `offset = -1`) instead of
-  ## `pstSuccess`.
+  ## `send` for the txn its caller captured (`scope`, nil outside one), so a call that
+  ## waited before sending cannot join a txn begun meanwhile.
   requireRunning(p)
   # Before any await, so a send outside a txn fails as such, not as a replaced txn; and
   # before the size check, so not as a rejection the caller may skip either.
-  if p.transactionalId.isSome and p.txnState != tsInTransaction:
-    raise newException(KafkaError, "must call beginTransaction before send")
+  if p.transactionalId.isSome:
+    p.requireTxnScope(scope, "must call beginTransaction before send", "send")
 
   let actualTimestamp = resolveTimestamp(timestamp)
   let rec = Record(
@@ -1203,15 +1144,14 @@ proc send*(
         $recordBatchV2HeaderBytes & " exceeds maxBatchBytes " & $p.maxBatchBytes,
     )
 
-  # Set while this send counts toward `txnUnjoinedSends`: from the txn check until its record
-  # joins. A failure meanwhile must poison the txn here (see poisonTxnOnUnjoinedSend).
-  let txnSeq = p.txnSeq
+  # Set while this send counts toward `scope.unjoined`: from the txn check until its record
+  # joins. A failure meanwhile must poison the txn here (see poisonTxnOnUnjoined).
   var unjoined = false
   template leaveUnjoined() =
     # Idempotent: drop this send from the count at most once.
     if unjoined:
       unjoined = false
-      p.leaveUnjoinedSend(txnSeq)
+      dec scope.unjoined
 
   defer:
     leaveUnjoined()
@@ -1229,16 +1169,14 @@ proc send*(
   try:
     if p.transactionalId.isSome:
       # Counted from here, so the commit cannot go through while this record may still join.
-      inc p.txnUnjoinedSends
+      inc scope.unjoined
       unjoined = true
       # A deferred epoch bump (broker still finalizing the prior txn) must be retried before this
       # txn's first record, else AddPartitionsToTxn goes out with a stale producerEpoch and is fenced.
       if p.pendingEpochBump:
         await p.ensureEpochBumped()
         requireRunning(p)
-        let changed = p.sendTxnChange(txnSeq)
-        if changed.isSome:
-          raise newException(KafkaError, changed.get)
+        p.requireTxnUnchanged(scope, "send")
     elif p.enableIdempotence:
       await p.ensureIdempotenceInitialized()
       requireRunning(p)
@@ -1270,9 +1208,7 @@ proc send*(
       # (txnLock is outermost, so awaiting the coordinator request nests no further).
       await p.txnLock.acquire()
       try:
-        let changed = p.sendTxnChange(txnSeq)
-        if changed.isSome:
-          raise newException(KafkaError, changed.get)
+        p.requireTxnUnchanged(scope, "send")
         # Record whether this call added `tp` to the pending set, so a register failure
         # rolls back only our own entry, not those from earlier sends.
         let addedHere = tp notin p.txnPartitions and tp notin p.txnPendingPartitions
@@ -1392,7 +1328,7 @@ proc send*(
           p.releasePendingRecordPermit()
           raise
         try:
-          p.assertBatchEnqueueable(txnSeq)
+          p.assertBatchEnqueueable(scope)
           let curBytes = p.pendingBatchBytes.getOrDefault(tp, 0'i64)
           var curLen = 0
           p.batches.withValue(tp, batch):
@@ -1433,12 +1369,41 @@ proc send*(
         raise newException(KafkaError, e.msg)
   except CancelledError as e:
     if unjoined:
-      p.poisonTxnOnUnjoinedSend(txnSeq, e)
+      p.poisonTxnOnUnjoined(scope, e)
     raise e
   except KafkaError as e:
     if unjoined:
-      p.poisonTxnOnUnjoinedSend(txnSeq, e)
+      p.poisonTxnOnUnjoined(scope, e)
     raise e
+
+proc send*(
+    p: KafkaProducer,
+    topic: string,
+    value: Option[seq[byte]],
+    key: Option[seq[byte]] = none(seq[byte]),
+    partition: int32 = -1,
+    headers: seq[RecordHeader] = @[],
+    timestamp: int64 = 0,
+): Future[ProduceResult] {.async: (raises: [KafkaError, CancelledError], raw: true).} =
+  ## Buffer one record for `topic` and resolve with its `ProduceResult` once acked. A negative
+  ## `partition` selects via the configured strategy (key hash when keyed); oversized records
+  ## raise before buffering. Inside a transaction the send joins it — commit only after it acked.
+  ## A send that fails before its record joins still poisons that transaction, so after a
+  ## failed or cancelled send (a timeout included) the commit either carries the record or is
+  ## refused; so is a commit made while the send has yet to join (one that `sendFireAndForget`
+  ## handed off while `maxPendingRecords` was full, say). The exception is
+  ## `KafkaRecordRejectedError` (an oversized record): the transaction stays committable, so
+  ## the caller may skip the record. The record never joins a later transaction begun while
+  ## the send awaited (nor one whose commit or abort was already called: refused).
+  ##
+  ## A `none` value sends a tombstone (null value) for compacted topics; pair it
+  ## with a key so the broker can match the key to delete. A nil `seq[byte]` passed
+  ## to the `seq[byte]` overload stays an empty value, not a tombstone.
+  ##
+  ## A failure the producer's `errorHandler` diverts does not raise: the result's `status` is
+  ## `pstDropped`, `pstDeadLettered`, or `pstDeadLetterFailed` (with `offset = -1`) instead of
+  ## `pstSuccess`.
+  p.sendScoped(p.currentTxnScope(), topic, value, key, partition, headers, timestamp)
 
 proc send*(
     p: KafkaProducer,
@@ -1557,7 +1522,7 @@ proc flush*(p: KafkaProducer) {.async: (raises: []).} =
     return
 
 proc runEndTxn(
-    p: KafkaProducer, committed: bool
+    p: KafkaProducer, scope: TxnScope, committed: bool
 ): Future[bool] {.async: (raises: [KafkaError, CancelledError]).} =
   ## Shared body of `commitTransaction` / `abortTransaction`, run with `txnLock` held and the
   ## preconditions checked: drain buffered sends, issue `EndTxn`, settle the deferred epoch bump,
@@ -1594,19 +1559,21 @@ proc runEndTxn(
     # mid round-trip invisibly, so drain those too before EndTxn can race a produce of this txn.
     await p.awaitInflightFlushes()
     if committed and p.txnState in {tsError, tsFatal}:
-      # A transactional send that failed terminally already set tsError/tsFatal (in
-      # doSendWithRetry); refuse to finalize rather than commit a txn missing records (EOS).
+      # A send or sendOffsetsToTransaction of this txn failed and set tsError/tsFatal; refuse to
+      # finalize rather than commit a txn missing records or offsets (EOS).
       raise newException(
         KafkaError,
-        "cannot commit: a buffered send failed during flush (state: " & $p.txnState & ")",
+        "cannot commit: a send or sendOffsetsToTransaction of this transaction failed (state: " &
+          $p.txnState & ")",
       )
-    if committed and p.txnUnjoinedSends > 0:
-      # A send of this txn is still short of joining it (waiting on backpressure, txnLock or
-      # metadata) and no longer can: committing would finalize the txn without its record.
+    if committed and scope.unjoined > 0:
+      # A send or sendOffsetsToTransaction of this txn is still short of joining it (waiting on
+      # backpressure, txnLock or metadata) and no longer can: committing would finalize the txn
+      # without its record or offsets.
       raise newException(
         KafkaError,
-        "cannot commit: " & $p.txnUnjoinedSends &
-          " send(s) of this transaction have not joined it",
+        "cannot commit: " & $scope.unjoined &
+          " send / sendOffsetsToTransaction call(s) of this transaction have not joined it",
       )
     if not p.txnStarted:
       # Nothing reached the coordinator, so its metadata is still `Empty` and EndTxn would be
@@ -1659,28 +1626,74 @@ proc runEndTxn(
       p.finalizeTxnTracking(owesEpochBump = true)
     raise e
 
-proc commitTransaction*(
-    p: KafkaProducer
-) {.async: (raises: [KafkaError, CancelledError]).} =
-  ## Flush buffered sends, send `EndTxn(commit)`, and settle the deferred epoch
-  ## bump. Refuses — raising without committing — when a buffered send failed,
-  ## a send has yet to join the transaction, or the transaction is poisoned, so a
-  ## commit never finalizes missing records.
+proc closeAndLockTxn(
+    p: KafkaProducer, abort: bool
+): Future[TxnScope] {.async: (raises: [KafkaError, CancelledError]).} =
+  ## Shared entry of `commitTransaction` / `abortTransaction`: close the current txn,
+  ## then take txnLock; returns the closed scope with the lock held. Closed before
+  ## the awaits, which can suspend: a send made meanwhile would otherwise count
+  ## against the commit and have it refused.
+  result = p.txnScope
+  # A finished txn keeps its scope until the next begin; leave how it ended as is.
+  if p.currentTxnScope() != nil:
+    if abort:
+      result.ending = teAbortCalled
+    elif result.ending == teOpen:
+      result.ending = teCommitCalled
   # Resolve any deferred epoch bump BEFORE taking txnLock (lock order: txnLock outermost): a
   # zero-send transaction would otherwise send EndTxn with a stale producerEpoch and be fenced.
   await p.ensureEpochBumped()
   await p.txnLock.acquire()
 
+proc requireFinalizable(
+    p: KafkaProducer, scope: TxnScope, verb: string
+) {.raises: [KafkaError].} =
+  ## Under txnLock: refuse a fatal producer, or a call whose txn (`scope`) ended
+  ## while it waited, so it cannot finalize the one begun since.
+  p.requireNotFatal()
+  p.requireSameTxn(scope, verb)
+
+proc commitTransaction*(
+    p: KafkaProducer
+) {.async: (raises: [KafkaError, CancelledError]).} =
+  ## Flush buffered sends, send `EndTxn(commit)`, and settle the deferred epoch
+  ## bump. Refuses — raising without committing — when a buffered send failed, a
+  ## `send` or `sendOffsetsToTransaction` has yet to join the transaction, the
+  ## transaction is poisoned, or `abortTransaction` was called on it, so a commit
+  ## never finalizes missing records. The transaction closes on the call, even if
+  ## the commit then fails: abort it, or retry while it is not left abort-only.
+  template failCommit(e: ref KafkaError) =
+    # Bound once: `e` may be a `newException` call.
+    let err = e
+    emitMetric(
+      p.metricsHook,
+      meProducerTxnCommitError,
+      txnErrorTags(kafkaErrorTag(err), $errorClassToCstring(ecUnknown)),
+      1,
+    )
+    raise err
+
+  # Only an abort called ahead of this commit, on a txn still in progress, refuses it;
+  # refuse before waiting behind it.
+  let current = p.currentTxnScope()
+  if current != nil and current.ending == teAbortCalled:
+    failCommit(
+      newException(KafkaError, "cannot commit: abortTransaction was already called")
+    )
+  # The awaits inside the try, so a commit failing there, the txn closed already,
+  # still emits its error metric.
+  var locked = false
   try:
-    if p.txnState == tsFatal:
-      raise newException(KafkaError, "producer is in a fatal state and must be closed")
+    let scope = await p.closeAndLockTxn(abort = false)
+    locked = true
+    p.requireFinalizable(scope, "commit")
     if not p.tryTransition(tsCommitting):
       raise newException(
         KafkaError, "cannot commit: not in transaction (state: " & $p.txnState & ")"
       )
     # The empty-transaction short-circuit still reports success; it is the
     # deferred-bump shape that says a bump is owed.
-    if await runEndTxn(p, committed = true):
+    if await runEndTxn(p, scope, committed = true):
       emitMetric(p.metricsHook, meProducerTxnCommitOk, [("empty", "true")], 1)
     else:
       emitMetric(
@@ -1709,32 +1722,26 @@ proc commitTransaction*(
     )
     raise e
   except KafkaError as e:
-    emitMetric(
-      p.metricsHook,
-      meProducerTxnCommitError,
-      txnErrorTags(kafkaErrorTag(e), $errorClassToCstring(ecUnknown)),
-      1,
-    )
-    raise e
+    failCommit(e)
   finally:
-    p.txnLock.releaseSafely("producer.commitTransaction")
+    if locked:
+      p.txnLock.releaseSafely("producer.commitTransaction")
 
 proc abortTransaction*(
     p: KafkaProducer
 ) {.async: (raises: [KafkaError, CancelledError]).} =
-  ## Discard buffered sends, send `EndTxn(abort)`, and settle the deferred
+  ## Flush buffered sends (aborted with the transaction, never visible to
+  ## read_committed consumers), send `EndTxn(abort)`, and settle the deferred
   ## epoch bump. Safe from poisoned states; never commits anything. Refused by a
   ## `tsFatal` producer, which only `close` tears down, leaving the broker-side
-  ## transaction to the coordinator's timeout.
-  # See commitTransaction: resolve a deferred epoch bump before txnLock so
-  # EndTxn (abort) carries the current epoch and respects the lock order.
-  await p.ensureEpochBumped()
-  await p.txnLock.acquire()
-
+  ## transaction to the coordinator's timeout. Closes the transaction on the call,
+  ## as `commitTransaction` does.
+  var locked = false
   try:
-    if p.txnState == tsFatal:
-      raise newException(KafkaError, "producer is in a fatal state and must be closed")
-    if p.txnState notin {tsInTransaction, tsError, tsCommitting, tsAborting}:
+    let scope = await p.closeAndLockTxn(abort = true)
+    locked = true
+    p.requireFinalizable(scope, "abort")
+    if p.txnState notin txnInProgressStates:
       raise newException(
         KafkaError, "cannot abort: not in transaction (state: " & $p.txnState & ")"
       )
@@ -1742,7 +1749,7 @@ proc abortTransaction*(
       raise newException(
         KafkaError, "cannot transition to aborting from state: " & $p.txnState
       )
-    if await runEndTxn(p, committed = false):
+    if await runEndTxn(p, scope, committed = false):
       emitMetric(p.metricsHook, meProducerTxnAbortOk, [("empty", "true")], 1)
     else:
       emitMetric(
@@ -1776,7 +1783,8 @@ proc abortTransaction*(
     )
     raise e
   finally:
-    p.txnLock.releaseSafely("producer.abortTransaction")
+    if locked:
+      p.txnLock.releaseSafely("producer.abortTransaction")
 
 proc sendFireAndForget*(
     p: KafkaProducer,
@@ -1794,7 +1802,7 @@ proc sendFireAndForget*(
   ## a transaction, commit only once `callback` ran. A commit made after this
   ## returned, while the send has yet to join the transaction, is refused; one
   ## made while the call still waits for a `maxPendingFireAndForget` slot is not,
-  ## as nothing was handed off yet.
+  ## as nothing was handed off yet: the send then fails to `callback` instead.
   ## A `none` value sends a tombstone (null value) for compacted topics. A nil
   ## `seq[byte]` passed to the `seq[byte]` overload stays an empty value.
   proc invokeCallback(res: ProduceResult, err: ref KafkaError) {.raises: [].} =
@@ -1811,6 +1819,8 @@ proc sendFireAndForget*(
     if raised != nil and err != nil:
       warn "sendFireAndForget error (callback raised): ", err.msg
 
+  # Captured before the slot wait, so a txn begun meanwhile cannot take the record.
+  let scope = p.currentTxnScope()
   await p.fireAndForgetSem.acquire()
 
   # The acquire may have suspended long enough for close() to advance state;
@@ -1831,7 +1841,8 @@ proc sendFireAndForget*(
 
   proc task() {.async: (raises: []).} =
     try:
-      let res = await p.send(topic, value, key, partition, headers, timestamp)
+      let res =
+        await p.sendScoped(scope, topic, value, key, partition, headers, timestamp)
       invokeCallback(res, nil)
     except KafkaError as e:
       invokeCallback(ProduceResult(topic: topic, partition: partition, offset: -1), e)
