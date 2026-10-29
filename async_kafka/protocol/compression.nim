@@ -7,8 +7,7 @@ import ../errors
 import lz4, zstd
 
 type CompressionCodec* = enum
-  ## Record-batch compression codec. `ccLz4` needs the system liblz4 at run time;
-  ## the others are linked into the binary.
+  ## Record-batch compression codec. Every codec is linked into the binary.
   ccNone = 0
   ccGzip = 1
   ccSnappy = 2
@@ -246,16 +245,6 @@ proc gzipDecompress(
     raise newException(KafkaError, "gzip CRC mismatch")
   if uint32(result.len) != storedIsize:
     raise newException(KafkaError, "gzip ISIZE mismatch")
-
-proc ensureCodecAvailable*(codec: CompressionCodec) {.raises: [KafkaError].} =
-  ## Raise when `codec` needs a runtime library this host cannot provide: gzip,
-  ## snappy and zstd are linked in, while lz4 is resolved with `dlopen` on first
-  ## use, so only it can be missing at run time.
-  if codec == ccLz4:
-    try:
-      ensureLz4Loaded()
-    except KafkaError as e:
-      raise newException(KafkaError, "ccLz4 requires the system liblz4: " & e.msg)
 
 proc compressRecords*(
     data: openArray[byte], codec: CompressionCodec
